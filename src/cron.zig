@@ -77,6 +77,8 @@ pub const DeliveryConfig = struct {
     channel: ?[]const u8 = null,
     to: ?[]const u8 = null,
     best_effort: bool = true,
+    channel_owned: bool = false,
+    to_owned: bool = false,
 };
 
 pub const CronRun = struct {
@@ -421,6 +423,12 @@ pub const CronScheduler = struct {
         if (job.name) |name| self.allocator.free(name);
         if (job.model) |model| self.allocator.free(model);
         if (job.last_output) |output| self.allocator.free(output);
+        if (job.delivery.channel_owned) {
+            if (job.delivery.channel) |channel| self.allocator.free(channel);
+        }
+        if (job.delivery.to_owned) {
+            if (job.delivery.to) |to| self.allocator.free(to);
+        }
     }
 
     pub fn deinit(self: *CronScheduler) void {
@@ -1170,6 +1178,8 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
                 .mode = delivery_mode,
                 .channel = if (delivery_channel) |c| try scheduler.allocator.dupe(u8, c) else null,
                 .to = if (delivery_to) |t| try scheduler.allocator.dupe(u8, t) else null,
+                .channel_owned = delivery_channel != null,
+                .to_owned = delivery_to != null,
             },
         });
     }

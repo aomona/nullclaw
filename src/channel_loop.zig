@@ -503,8 +503,18 @@ pub fn runTelegramLoop(
     // Update activity timestamp at start
     loop_state.last_activity.store(std.time.timestamp(), .release);
 
-    // Check if parallel processing is enabled
-    const enable_parallel = config.session.max_concurrent_tasks > 1;
+    // Parallel worker bookkeeping.
+    var worker_threads: std.ArrayListUnmanaged(std.Thread) = .empty;
+    defer {
+        for (worker_threads.items) |thread| thread.join();
+        worker_threads.deinit(allocator);
+    }
+
+    const max_parallel_tasks: usize = if (config.session.max_concurrent_tasks > 1)
+        @intCast(config.session.max_concurrent_tasks)
+    else
+        1;
+    const enable_parallel = max_parallel_tasks > 1;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
         const messages = tg_ptr.pollUpdates(allocator) catch |err| {
@@ -548,11 +558,16 @@ pub fn runTelegramLoop(
             };
 
             if (enable_parallel) {
-                // Spawn a new thread for parallel message processing
-                // Each session is still serialized via Session.mutex inside processMessage
+                // Bound parallelism per channel loop instance.
+                while (worker_threads.items.len >= max_parallel_tasks) {
+                    const oldest = worker_threads.orderedRemove(0);
+                    oldest.join();
+                }
+
+                // Spawn a worker thread for this message.
+                // Each session is still serialized via Session.mutex inside processMessage.
                 const task = allocator.create(MessageTask) catch |err| {
-                    log.err("Failed to allocate task: {}, falling back to synchronous", .{err});
-                    // Fall through to synchronous processing
+                    log.err("Failed to allocate task: {}", .{err});
                     continue;
                 };
 
@@ -606,7 +621,10 @@ pub fn runTelegramLoop(
                     allocator.destroy(task);
                     continue;
                 };
-                thread.detach();
+                worker_threads.append(allocator, thread) catch {
+                    // Cannot track thread handle; join immediately to avoid runaway.
+                    thread.join();
+                };
             } else {
                 // Synchronous processing (original behavior)
                 const typing_target = msg.sender;

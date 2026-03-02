@@ -7,6 +7,9 @@ const cron = @import("../cron.zig");
 const CronScheduler = cron.CronScheduler;
 const loadScheduler = @import("cron_add.zig").loadScheduler;
 
+threadlocal var tls_schedule_channel: ?[]const u8 = null;
+threadlocal var tls_schedule_chat_id: ?[]const u8 = null;
+
 /// Schedule tool — lets the agent manage recurring and one-shot scheduled tasks.
 /// Delegates to the CronScheduler from the cron module for persistent job management.
 pub const ScheduleTool = struct {
@@ -16,17 +19,13 @@ pub const ScheduleTool = struct {
         \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"id":{"type":"string","description":"Task ID"},"chat_id":{"type":"string","description":"Chat ID for delivery notification (e.g. Telegram chat_id)"}},"required":["action"]}
     ;
 
-    /// Optional default chat_id for delivery (injected from channel context)
-    default_chat_id: ?[]const u8 = null,
-    /// Default channel for delivery (injected from channel context)
-    default_channel: ?[]const u8 = null,
-
     const vtable = root.ToolVTable(@This());
 
     /// Set the context for the current turn (called before agent.turn).
     pub fn setContext(self: *ScheduleTool, channel: ?[]const u8, chat_id: ?[]const u8) void {
-        self.default_channel = channel;
-        self.default_chat_id = chat_id;
+        _ = self;
+        tls_schedule_channel = channel;
+        tls_schedule_chat_id = chat_id;
     }
 
     pub fn tool(self: *ScheduleTool) Tool {
@@ -37,11 +36,13 @@ pub const ScheduleTool = struct {
     }
 
     pub fn execute(self: *ScheduleTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+        _ = self;
         const action = root.getString(args, "action") orelse
             return ToolResult.fail("Missing 'action' parameter");
 
-        // Get chat_id from args or use default
-        const chat_id = root.getString(args, "chat_id") orelse self.default_chat_id;
+        // Prefer explicit args; otherwise use per-thread context injected by channel_loop.
+        const chat_id = root.getString(args, "chat_id") orelse tls_schedule_chat_id;
+        const delivery_channel = tls_schedule_channel orelse "telegram";
 
         if (std.mem.eql(u8, action, "list")) {
             var scheduler = loadScheduler(allocator) catch {
@@ -130,8 +131,10 @@ pub const ScheduleTool = struct {
             if (chat_id) |cid| {
                 job.delivery = .{
                     .mode = .always,
-                    .channel = try allocator.dupe(u8, "telegram"),
+                    .channel = try allocator.dupe(u8, delivery_channel),
                     .to = try allocator.dupe(u8, cid),
+                    .channel_owned = true,
+                    .to_owned = true,
                 };
             }
 
@@ -165,8 +168,10 @@ pub const ScheduleTool = struct {
             if (chat_id) |cid| {
                 job.delivery = .{
                     .mode = .always,
-                    .channel = try allocator.dupe(u8, "telegram"),
+                    .channel = try allocator.dupe(u8, delivery_channel),
                     .to = try allocator.dupe(u8, cid),
+                    .channel_owned = true,
+                    .to_owned = true,
                 };
             }
 

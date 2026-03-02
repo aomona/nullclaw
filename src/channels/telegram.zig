@@ -668,7 +668,7 @@ pub const TelegramChannel = struct {
                 // Extract the mentioned username (skip the @)
                 if (offset + 1 >= text.len) continue;
                 const end = @min(offset + length, text.len);
-                const mentioned = text[offset + 1..end];
+                const mentioned = text[offset + 1 .. end];
 
                 // Case-insensitive comparison
                 if (std.ascii.eqlIgnoreCase(mentioned, bot_name)) {
@@ -2258,6 +2258,10 @@ pub const TelegramChannel = struct {
         self.pending_media_messages.deinit(self.allocator);
         self.pending_media_group_ids.deinit(self.allocator);
         self.pending_media_received_at.deinit(self.allocator);
+        if (self.bot_username) |name| {
+            self.allocator.free(name);
+            self.bot_username = null;
+        }
     }
 
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {

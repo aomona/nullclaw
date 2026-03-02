@@ -599,6 +599,13 @@ pub const Config = struct {
                         has_field = true;
                     }
                 }
+                if (comptime @hasField(ProviderEntry, "user_agent")) {
+                    if (entry.user_agent) |ua| {
+                        if (has_field) try w.print(", ", .{});
+                        try w.print("\"user_agent\": \"{s}\"", .{ua});
+                        has_field = true;
+                    }
+                }
                 try w.print("}}", .{});
                 if (i + 1 < self.providers.len) try w.print(",", .{});
                 try w.print("\n", .{});
@@ -2878,6 +2885,7 @@ test "json parse providers section" {
         allocator.free(e.name);
         if (e.api_key) |k| allocator.free(k);
         if (e.base_url) |b| allocator.free(b);
+        if (e.user_agent) |ua| allocator.free(ua);
     }
     allocator.free(cfg.providers);
 }
@@ -2904,6 +2912,7 @@ test "save writes provider native_tools when false" {
             .name = "groq",
             .api_key = "gsk_test",
             .native_tools = false,
+            .user_agent = "nullclaw-test/1.0",
         },
     };
 
@@ -2915,6 +2924,7 @@ test "save writes provider native_tools when false" {
     defer allocator.free(content);
 
     try std.testing.expect(std.mem.indexOf(u8, content, "\"native_tools\": false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"user_agent\": \"nullclaw-test/1.0\"") != null);
 }
 
 test "json parse tools.media.audio section" {
@@ -2982,6 +2992,7 @@ test "defaultProviderKey returns key for default provider" {
         allocator.free(e.name);
         if (e.api_key) |k| allocator.free(k);
         if (e.base_url) |b| allocator.free(b);
+        if (e.user_agent) |ua| allocator.free(ua);
     }
     allocator.free(cfg.providers);
 }
