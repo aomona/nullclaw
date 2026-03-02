@@ -43,6 +43,14 @@ pub fn getValue(args: JsonObjectMap, key: []const u8) ?JsonValue {
     return args.get(key);
 }
 
+pub fn getStringArray(args: JsonObjectMap, key: []const u8) ?[]const JsonValue {
+    const val = args.get(key) orelse return null;
+    return switch (val) {
+        .array => |a| a.items,
+        else => null,
+    };
+}
+
 /// Test helper: parse a JSON string into a Parsed(Value) for use in tool tests.
 /// The caller must `defer parsed.deinit()` and extract `.value.object` for the ObjectMap.
 pub fn parseTestArgs(json_str: []const u8) !std.json.Parsed(JsonValue) {
