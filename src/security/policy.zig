@@ -959,6 +959,23 @@ test "allowlist command-star entries still enforce command-specific arg safety" 
     try std.testing.expect(!p.isCommandAllowed("git config core.editor vim"));
 }
 
+test "allowlist command-star entry reaches high-risk runtime gate" {
+    var blocked = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"curl *"},
+        .block_high_risk_commands = true,
+    };
+    try std.testing.expectError(error.HighRiskBlocked, blocked.validateCommandExecution("curl https://example.com", false));
+
+    var unblocked = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"curl *"},
+        .block_high_risk_commands = false,
+    };
+    const risk = try unblocked.validateCommandExecution("curl https://example.com", false);
+    try std.testing.expectEqual(CommandRiskLevel.high, risk);
+}
+
 test "containsSingleAmpersand detects correctly" {
     // These have single & -> should detect
     try std.testing.expect(containsSingleAmpersand("cmd & other"));
