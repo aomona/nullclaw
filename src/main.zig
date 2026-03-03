@@ -135,6 +135,17 @@ fn printVersion() void {
 
 const GatewayDaemonOverrideError = error{InvalidPort};
 
+fn applyRuntimeProviderOverrides(config: *const yc.config.Config) void {
+    yc.http_util.setProxyOverride(config.http_request.proxy) catch |err| {
+        std.debug.print("Invalid http_request.proxy override: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    yc.providers.setApiErrorLimitOverride(config.diagnostics.api_error_max_chars) catch |err| {
+        std.debug.print("Invalid diagnostics.api_error_max_chars override: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+}
+
 fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const u8) GatewayDaemonOverrideError!void {
     var port: u16 = cfg.gateway.port;
     var host: []const u8 = cfg.gateway.host;
@@ -172,6 +183,7 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
         yc.config.Config.printValidationError(err);
         std.process.exit(1);
     };
+    applyRuntimeProviderOverrides(&cfg);
 
     try yc.daemon.run(allocator, &cfg, cfg.gateway.host, cfg.gateway.port);
 }
@@ -1406,6 +1418,7 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         yc.config.Config.printValidationError(err);
         std.process.exit(1);
     };
+    applyRuntimeProviderOverrides(&config);
 
     if (!hasConfiguredStartableChannels(&config)) {
         if (hasConfiguredButBuildDisabledStartableChannels(&config)) {

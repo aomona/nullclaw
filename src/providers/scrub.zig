@@ -2,19 +2,44 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const DEFAULT_MAX_API_ERROR_CHARS: usize = 200;
+const MIN_MAX_API_ERROR_CHARS: usize = 200;
+const MAX_MAX_API_ERROR_CHARS: usize = 10_000;
+
+var max_api_error_chars_override: ?usize = null;
+
+pub const ApiErrorLimitOverrideError = error{OutOfRange};
+
+/// Set process-wide API error truncation limit from config.
+/// Null clears the override and falls back to env/default behavior.
+pub fn setApiErrorLimitOverride(limit: ?u32) ApiErrorLimitOverrideError!void {
+    if (limit) |v| {
+        const n: usize = @intCast(v);
+        if (n < MIN_MAX_API_ERROR_CHARS or n > MAX_MAX_API_ERROR_CHARS) {
+            return error.OutOfRange;
+        }
+        max_api_error_chars_override = n;
+        return;
+    }
+    max_api_error_chars_override = null;
+}
 
 fn readMaxApiErrorCharsFromEnv() usize {
     if (std.process.getEnvVarOwned(std.heap.page_allocator, "NULLCLAW_MAX_ERROR_CHARS")) |env_val| {
         defer std.heap.page_allocator.free(env_val);
         const val = std.fmt.parseInt(usize, env_val, 10) catch DEFAULT_MAX_API_ERROR_CHARS;
-        // Limit to reasonable range: 200 to 10000
-        return if (val < 200) 200 else if (val > 10000) 10000 else val;
+        return if (val < MIN_MAX_API_ERROR_CHARS)
+            MIN_MAX_API_ERROR_CHARS
+        else if (val > MAX_MAX_API_ERROR_CHARS)
+            MAX_MAX_API_ERROR_CHARS
+        else
+            val;
     } else |_| {
         return DEFAULT_MAX_API_ERROR_CHARS;
     }
 }
 
 fn getMaxApiErrorChars() usize {
+    if (max_api_error_chars_override) |n| return n;
     if (builtin.is_test) return DEFAULT_MAX_API_ERROR_CHARS;
     return readMaxApiErrorCharsFromEnv();
 }
@@ -246,6 +271,26 @@ test "sanitizeApiError no secret no change" {
     const result = try sanitizeApiError(allocator, "simple upstream timeout");
     defer allocator.free(result);
     try std.testing.expectEqualStrings("simple upstream timeout", result);
+}
+
+test "sanitizeApiError respects config override limit" {
+    try setApiErrorLimitOverride(350);
+    defer setApiErrorLimitOverride(null) catch unreachable;
+
+    const allocator = std.testing.allocator;
+    const long = try allocator.alloc(u8, 500);
+    defer allocator.free(long);
+    @memset(long, 'b');
+
+    const result = try sanitizeApiError(allocator, long);
+    defer allocator.free(result);
+    try std.testing.expect(result.len <= 353);
+    try std.testing.expect(std.mem.endsWith(u8, result, "..."));
+}
+
+test "setApiErrorLimitOverride rejects out-of-range values" {
+    try std.testing.expectError(error.OutOfRange, setApiErrorLimitOverride(10));
+    try std.testing.expectError(error.OutOfRange, setApiErrorLimitOverride(20_000));
 }
 
 test "scrubSecretPatterns redacts ghp_ GitHub tokens" {

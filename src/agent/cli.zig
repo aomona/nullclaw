@@ -8,6 +8,7 @@ const log = std.log.scoped(.agent);
 const Config = @import("../config.zig").Config;
 const providers = @import("../providers/root.zig");
 const Provider = providers.Provider;
+const http_util = @import("../http_util.zig");
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
 const memory_mod = @import("../memory/root.zig");
@@ -148,6 +149,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     cfg.validate() catch |err| {
         Config.printValidationError(err);
+        return;
+    };
+
+    http_util.setProxyOverride(cfg.http_request.proxy) catch |err| {
+        log.err("Invalid http_request.proxy override: {s}", .{@errorName(err)});
+        return;
+    };
+    providers.setApiErrorLimitOverride(cfg.diagnostics.api_error_max_chars) catch |err| {
+        log.err("Invalid diagnostics.api_error_max_chars override: {s}", .{@errorName(err)});
         return;
     };
 

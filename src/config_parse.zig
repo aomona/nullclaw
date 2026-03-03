@@ -524,6 +524,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (diag.object.get("log_llm_io")) |v| {
                 if (v == .bool) self.diagnostics.log_llm_io = v.bool;
             }
+            if (diag.object.get("api_error_max_chars")) |v| {
+                if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) {
+                    self.diagnostics.api_error_max_chars = @intCast(v.integer);
+                }
+            }
             if (diag.object.get("otel")) |otel| {
                 if (otel == .object) {
                     if (otel.object.get("endpoint")) |v| {
@@ -1425,6 +1430,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (hr.object.get("allowed_domains")) |v| {
                 if (v == .array) self.http_request.allowed_domains = try parseStringArray(self.allocator, v.array);
+            }
+            if (hr.object.get("proxy")) |v| {
+                if (v == .string) self.http_request.proxy = try self.allocator.dupe(u8, v.string);
             }
             if (hr.object.get("search_base_url")) |v| {
                 if (v == .string) self.http_request.search_base_url = try self.allocator.dupe(u8, v.string);

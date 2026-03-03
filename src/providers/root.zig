@@ -27,6 +27,7 @@ pub const helpers = @import("helpers.zig");
 pub const scrubSecretPatterns = scrub.scrubSecretPatterns;
 pub const scrubToolOutput = scrub.scrubToolOutput;
 pub const sanitizeApiError = scrub.sanitizeApiError;
+pub const setApiErrorLimitOverride = scrub.setApiErrorLimitOverride;
 
 // Re-exports from api_key.zig
 pub const resolveApiKey = api_key.resolveApiKey;
