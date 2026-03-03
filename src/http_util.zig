@@ -422,31 +422,23 @@ pub fn curlGet(allocator: Allocator, url: []const u8, headers: []const []const u
 /// Checks HTTPS_PROXY, HTTP_PROXY, ALL_PROXY in that order.
 /// Returns null if no proxy is set.
 /// Caller owns returned memory.
-const MAX_PROXY_OVERRIDE_CHARS: usize = 1024;
-var proxy_override_enabled: bool = false;
-var proxy_override_len: usize = 0;
-var proxy_override_buf: [MAX_PROXY_OVERRIDE_CHARS]u8 = undefined;
+var proxy_override_value: ?[]u8 = null;
 
-pub const ProxyOverrideError = error{ProxyTooLong};
+pub const ProxyOverrideError = error{OutOfMemory};
 
 /// Set process-wide proxy override from config.
 /// When set, this value has higher priority than proxy environment variables.
 pub fn setProxyOverride(proxy: ?[]const u8) ProxyOverrideError!void {
+    if (proxy_override_value) |existing| {
+        std.heap.page_allocator.free(existing);
+        proxy_override_value = null;
+    }
+
     if (proxy) |raw| {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        if (trimmed.len == 0) {
-            proxy_override_enabled = false;
-            proxy_override_len = 0;
-            return;
-        }
-        if (trimmed.len > MAX_PROXY_OVERRIDE_CHARS) return error.ProxyTooLong;
-        @memcpy(proxy_override_buf[0..trimmed.len], trimmed);
-        proxy_override_len = trimmed.len;
-        proxy_override_enabled = true;
-        return;
+        if (trimmed.len == 0) return;
+        proxy_override_value = try std.heap.page_allocator.dupe(u8, trimmed);
     }
-    proxy_override_enabled = false;
-    proxy_override_len = 0;
 }
 
 fn normalizeProxyEnvValue(allocator: Allocator, val: []const u8) !?[]const u8 {
@@ -456,8 +448,8 @@ fn normalizeProxyEnvValue(allocator: Allocator, val: []const u8) !?[]const u8 {
 }
 
 pub fn getProxyFromEnv(allocator: Allocator) !?[]const u8 {
-    if (proxy_override_enabled) {
-        return try allocator.dupe(u8, proxy_override_buf[0..proxy_override_len]);
+    if (proxy_override_value) |override| {
+        return try allocator.dupe(u8, override);
     }
 
     const env_vars = [_][]const u8{ "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY" };
@@ -613,4 +605,21 @@ test "setProxyOverride applies and clears process-wide override" {
         // Environment may define a proxy; only assert our override no longer leaks.
         try std.testing.expect(!std.mem.eql(u8, proxy, normalized_override));
     }
+}
+
+test "setProxyOverride accepts long proxy URLs" {
+    const allocator = std.testing.allocator;
+    var long_proxy = try allocator.alloc(u8, 1600);
+    defer allocator.free(long_proxy);
+
+    @memcpy(long_proxy[0.."http://".len], "http://");
+    @memset(long_proxy["http://".len..], 'a');
+
+    try setProxyOverride(long_proxy);
+    defer setProxyOverride(null) catch unreachable;
+
+    const from_override = try getProxyFromEnv(allocator);
+    defer if (from_override) |v| allocator.free(v);
+    try std.testing.expect(from_override != null);
+    try std.testing.expectEqual(long_proxy.len, from_override.?.len);
 }
