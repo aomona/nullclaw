@@ -563,14 +563,26 @@ fn curlPostOAuth(allocator: std.mem.Allocator, url: []const u8, body: []const u8
     try child.spawn();
 
     if (child.stdin) |stdin_file| {
-        stdin_file.writeAll(body) catch return error.CurlWriteError;
+        stdin_file.writeAll(body) catch {
+            stdin_file.close();
+            child.stdin = null;
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.CurlWriteError;
+        };
         stdin_file.close();
         child.stdin = null;
     } else {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
         return error.CurlWriteError;
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
+    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CurlReadError;
+    };
 
     const term = child.wait() catch return error.CurlWaitError;
     switch (term) {

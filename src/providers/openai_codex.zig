@@ -425,10 +425,18 @@ fn codexStreamRequest(
     try child.spawn();
 
     if (child.stdin) |stdin_file| {
-        stdin_file.writeAll(body) catch return error.CurlWriteError;
+        stdin_file.writeAll(body) catch {
+            stdin_file.close();
+            child.stdin = null;
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.CurlWriteError;
+        };
         stdin_file.close();
         child.stdin = null;
     } else {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
         return error.CurlWriteError;
     }
 
