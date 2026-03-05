@@ -28,6 +28,7 @@ pub const DiscordChannel = struct {
     typing_handles: std.StringHashMapUnmanaged(*TypingTask) = .empty,
     thread_parent_ids: std.StringHashMapUnmanaged([]u8) = .empty,
     forum_parent_ids: std.StringHashMapUnmanaged(void) = .empty,
+    reply_thread_roots: std.StringHashMapUnmanaged([]u8) = .empty,
 
     // Gateway state
     running: Atomic(bool) = Atomic(bool).init(false),
@@ -55,6 +56,7 @@ pub const DiscordChannel = struct {
     const CHANNEL_TYPE_GUILD_PRIVATE_THREAD: i64 = 12;
     const CHANNEL_TYPE_GUILD_FORUM: i64 = 15;
     const CHANNEL_TYPE_GUILD_MEDIA: i64 = 16;
+    const MAX_REPLY_THREAD_ROOTS: usize = 4096;
 
     const InvalidSessionAction = enum {
         identify,
@@ -392,18 +394,47 @@ pub const DiscordChannel = struct {
         channel_id: []const u8,
         guild_id: ?[]const u8,
         thread_ctx: ThreadContext,
+        allow_reply_without_mention: bool,
     ) bool {
         if (!self.require_mention or guild_id == null) return false;
+        if (allow_reply_without_mention) return false;
 
         if (thread_ctx.is_thread) {
             if (thread_ctx.parent_id) |parent_id| {
                 if (self.isMentionExemptChannel(parent_id)) return false;
                 if (thread_ctx.is_forum_thread) return true;
             }
-            return false;
+            return true;
         }
 
         return !self.isMentionExemptChannel(channel_id);
+    }
+
+    fn upsertReplyThreadRoot(self: *DiscordChannel, message_id: []const u8, root_id: []const u8) !void {
+        if (self.reply_thread_roots.getPtr(message_id)) |existing_root| {
+            if (!std.mem.eql(u8, existing_root.*, root_id)) {
+                self.allocator.free(existing_root.*);
+                existing_root.* = try self.allocator.dupe(u8, root_id);
+            }
+            return;
+        }
+
+        if (self.reply_thread_roots.count() >= MAX_REPLY_THREAD_ROOTS) {
+            var it = self.reply_thread_roots.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(@constCast(entry.key_ptr.*));
+                self.allocator.free(entry.value_ptr.*);
+            }
+            self.reply_thread_roots.deinit(self.allocator);
+            self.reply_thread_roots = .empty;
+        }
+
+        const message_id_copy = try self.allocator.dupe(u8, message_id);
+        errdefer self.allocator.free(message_id_copy);
+        const root_id_copy = try self.allocator.dupe(u8, root_id);
+        errdefer self.allocator.free(root_id_copy);
+
+        try self.reply_thread_roots.put(self.allocator, message_id_copy, root_id_copy);
     }
 
     fn clearThreadCaches(self: *DiscordChannel) void {
@@ -421,6 +452,14 @@ pub const DiscordChannel = struct {
         }
         self.forum_parent_ids.deinit(self.allocator);
         self.forum_parent_ids = .empty;
+
+        var reply_it = self.reply_thread_roots.iterator();
+        while (reply_it.next()) |entry| {
+            self.allocator.free(@constCast(entry.key_ptr.*));
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.reply_thread_roots.deinit(self.allocator);
+        self.reply_thread_roots = .empty;
     }
 
     // ── Channel vtable ──────────────────────────────────────────────
@@ -1120,6 +1159,45 @@ pub const DiscordChannel = struct {
             else => false,
         } else false;
 
+        // Extract reply target message id, if this message is a reply.
+        const reply_to_message_id: ?[]const u8 = blk: {
+            const message_ref_val = d_obj.get("message_reference") orelse break :blk null;
+            if (message_ref_val != .object) break :blk null;
+            break :blk jsonString(message_ref_val.object, "message_id");
+        };
+
+        // Extract referenced message author id when available.
+        const referenced_author_id: ?[]const u8 = blk: {
+            const referenced_val = d_obj.get("referenced_message") orelse break :blk null;
+            if (referenced_val != .object) break :blk null;
+            const referenced_author_val = referenced_val.object.get("author") orelse break :blk null;
+            if (referenced_author_val != .object) break :blk null;
+            break :blk jsonString(referenced_author_val.object, "id");
+        };
+
+        var reply_from_known_chain = false;
+        const reply_thread_root_id: ?[]const u8 = if (reply_to_message_id) |reply_to_id| blk: {
+            if (self.reply_thread_roots.get(reply_to_id)) |known_root| {
+                reply_from_known_chain = true;
+                break :blk known_root;
+            }
+            break :blk reply_to_id;
+        } else null;
+
+        const reply_targets_bot = blk: {
+            const author = referenced_author_id orelse break :blk false;
+            const bot_uid = self.bot_user_id orelse break :blk false;
+            break :blk std.mem.eql(u8, author, bot_uid);
+        };
+
+        if (message_id) |mid| {
+            if (reply_thread_root_id) |root_id| {
+                self.upsertReplyThreadRoot(mid, root_id) catch |err| {
+                    log.warn("Discord: failed to cache reply context: {}", .{err});
+                };
+            }
+        }
+
         // Never process messages sent by this bot account.
         if (self.bot_user_id) |bot_uid| {
             if (std.mem.eql(u8, author_id, bot_uid)) {
@@ -1133,11 +1211,13 @@ pub const DiscordChannel = struct {
         }
 
         const thread_ctx = resolveThreadContext(self, channel_id, d_obj);
+        const allow_reply_without_mention =
+            reply_to_message_id != null and (reply_targets_bot or reply_from_known_chain);
 
         // Filter 2: require_mention in guild messages.
-        // - Normal threads: mentions are optional.
         // - Forum/media threads: mention exemption is controlled by parent forum ID in mention_exempt_channel_ids.
-        if (mentionRequiredForMessage(self, channel_id, guild_id, thread_ctx)) {
+        // - Replying to the bot (or an active reply chain) bypasses mention requirement.
+        if (mentionRequiredForMessage(self, channel_id, guild_id, thread_ctx, allow_reply_without_mention)) {
             const bot_uid = self.bot_user_id orelse "";
             if (!isMentioned(content, bot_uid)) {
                 return;
@@ -1227,6 +1307,10 @@ pub const DiscordChannel = struct {
         if (message_id) |mid| {
             try mw.writeAll(",\"message_id\":");
             try root.appendJsonStringW(mw, mid);
+        }
+        if (reply_thread_root_id) |thread_id| {
+            try mw.writeAll(",\"thread_id\":");
+            try root.appendJsonStringW(mw, thread_id);
         }
         if (thread_ctx.parent_id) |parent_id| {
             try mw.writeAll(",\"parent_channel_id\":");
@@ -1651,7 +1735,7 @@ test "discord handleMessageCreate ignores own bot messages" {
     try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
 }
 
-test "discord handleMessageCreate thread bypasses require_mention" {
+test "discord handleMessageCreate thread requires mention when not replying" {
     const alloc = std.testing.allocator;
     var event_bus = bus_mod.Bus.init();
     defer event_bus.close();
@@ -1680,10 +1764,64 @@ test "discord handleMessageCreate thread bypasses require_mention" {
     defer parsed.deinit();
 
     try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
+}
 
-    var msg = event_bus.consumeInbound() orelse return try std.testing.expect(false);
-    defer msg.deinit(alloc);
-    try std.testing.expectEqualStrings("thread-1", msg.chat_id);
+test "discord handleMessageCreate reply chain bypasses mention and carries thread_id" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .require_mention = true,
+    });
+    defer ch.clearThreadCaches();
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-1");
+    defer alloc.free(ch.bot_user_id.?);
+
+    // Bot's own reply is ignored for inbound, but should seed reply context map.
+    const bot_reply_1_json =
+        \\{"d":{"id":"b-1","channel_id":"c-2","guild_id":"g-2","content":"first","author":{"id":"bot-1","bot":true},"message_reference":{"message_id":"m-root"}}}
+    ;
+    const bot_reply_1 = try std.json.parseFromSlice(std.json.Value, alloc, bot_reply_1_json, .{});
+    defer bot_reply_1.deinit();
+    try ch.handleMessageCreate(bot_reply_1.value);
+
+    const user_reply_1_json =
+        \\{"d":{"id":"u-1","channel_id":"c-2","guild_id":"g-2","content":"follow up","author":{"id":"u-2","bot":false},"message_reference":{"message_id":"b-1"},"referenced_message":{"id":"b-1","author":{"id":"bot-1","bot":true}}}}
+    ;
+    const user_reply_1 = try std.json.parseFromSlice(std.json.Value, alloc, user_reply_1_json, .{});
+    defer user_reply_1.deinit();
+    try ch.handleMessageCreate(user_reply_1.value);
+
+    var msg_1 = event_bus.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg_1.deinit(alloc);
+    const meta_1 = try std.json.parseFromSlice(std.json.Value, alloc, msg_1.metadata_json.?, .{});
+    defer meta_1.deinit();
+    try std.testing.expectEqualStrings("m-root", meta_1.value.object.get("thread_id").?.string);
+
+    const bot_reply_2_json =
+        \\{"d":{"id":"b-2","channel_id":"c-2","guild_id":"g-2","content":"second","author":{"id":"bot-1","bot":true},"message_reference":{"message_id":"u-1"}}}
+    ;
+    const bot_reply_2 = try std.json.parseFromSlice(std.json.Value, alloc, bot_reply_2_json, .{});
+    defer bot_reply_2.deinit();
+    try ch.handleMessageCreate(bot_reply_2.value);
+
+    const user_reply_2_json =
+        \\{"d":{"id":"u-2","channel_id":"c-2","guild_id":"g-2","content":"continue","author":{"id":"u-2","bot":false},"message_reference":{"message_id":"b-2"},"referenced_message":{"id":"b-2","author":{"id":"bot-1","bot":true}}}}
+    ;
+    const user_reply_2 = try std.json.parseFromSlice(std.json.Value, alloc, user_reply_2_json, .{});
+    defer user_reply_2.deinit();
+    try ch.handleMessageCreate(user_reply_2.value);
+
+    var msg_2 = event_bus.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg_2.deinit(alloc);
+    const meta_2 = try std.json.parseFromSlice(std.json.Value, alloc, msg_2.metadata_json.?, .{});
+    defer meta_2.deinit();
+    try std.testing.expectEqualStrings("m-root", meta_2.value.object.get("thread_id").?.string);
 }
 
 test "discord handleMessageCreate forum thread requires mention unless parent exempt" {

@@ -1255,6 +1255,44 @@ test "resolveInboundRouteSessionKey routes discord channel messages by chat_id" 
     try std.testing.expectEqualStrings("agent:discord-channel-agent:discord:channel:778899", routed.?);
 }
 
+test "resolveInboundRouteSessionKey appends discord reply thread suffix" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "discord-channel-agent",
+            .match = .{
+                .channel = "discord",
+                .account_id = "discord-main",
+                .peer = .{ .kind = .channel, .id = "778899" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .discord = &[_]@import("config_types.zig").DiscordConfig{
+                .{ .account_id = "discord-main", .token = "token" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "discord",
+        .sender_id = "user-1",
+        .chat_id = "778899",
+        .content = "hello",
+        .session_key = "discord:778899",
+        .metadata_json = "{\"account_id\":\"discord-main\",\"guild_id\":\"guild-1\",\"channel_id\":\"778899\",\"thread_id\":\"m-root\"}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:discord-channel-agent:discord:channel:778899:thread:m-root", routed.?);
+}
+
 test "resolveInboundRouteSessionKey routes discord direct messages by sender" {
     const allocator = std.testing.allocator;
     const bindings = [_]agent_routing.AgentBinding{
