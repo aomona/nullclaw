@@ -59,6 +59,21 @@ pub const default_allowed_commands = [_][]const u8{
     "git", "npm", "cargo", "ls", "cat", "grep", "find", "echo", "pwd", "wc", "head", "tail",
 };
 
+pub const full_autonomy_default_allowed_commands = [_][]const u8{"*"};
+
+/// Resolve command allowlist defaults from autonomy level and configured list.
+/// - explicit config always wins
+/// - full autonomy + empty list => wildcard
+/// - other modes + empty list => conservative default list
+pub fn resolveAllowedCommands(
+    autonomy: AutonomyLevel,
+    configured: []const []const u8,
+) []const []const u8 {
+    if (configured.len > 0) return configured;
+    if (autonomy == .full) return &full_autonomy_default_allowed_commands;
+    return &default_allowed_commands;
+}
+
 /// Security policy enforced on all tool executions
 pub const SecurityPolicy = struct {
     autonomy: AutonomyLevel = .supervised,
@@ -1129,6 +1144,25 @@ test "default allowed commands includes expected tools" {
     try std.testing.expect(found_npm);
     try std.testing.expect(found_cargo);
     try std.testing.expect(found_ls);
+}
+
+test "resolveAllowedCommands full autonomy defaults to wildcard when unset" {
+    const resolved = resolveAllowedCommands(.full, &.{});
+    try std.testing.expectEqual(@as(usize, 1), resolved.len);
+    try std.testing.expectEqualStrings("*", resolved[0]);
+}
+
+test "resolveAllowedCommands supervised defaults to conservative set when unset" {
+    const resolved = resolveAllowedCommands(.supervised, &.{});
+    try std.testing.expectEqualStrings("git", resolved[0]);
+    try std.testing.expect(resolved.len >= 1);
+}
+
+test "resolveAllowedCommands preserves explicit configured list" {
+    const custom = [_][]const u8{"taskkill"};
+    const resolved = resolveAllowedCommands(.full, &custom);
+    try std.testing.expectEqual(@as(usize, 1), resolved.len);
+    try std.testing.expectEqualStrings("taskkill", resolved[0]);
 }
 
 test "blocks single ampersand background chaining" {

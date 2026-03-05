@@ -47,7 +47,7 @@ pub fn runTaskWithTools(
         .autonomy = request.autonomy,
         .workspace_dir = request.workspace_dir,
         .workspace_only = request.workspace_only,
-        .allowed_commands = if (request.allowed_commands.len > 0) request.allowed_commands else &security.default_allowed_commands,
+        .allowed_commands = security.resolveAllowedCommands(request.autonomy, request.allowed_commands),
         .max_actions_per_hour = request.max_actions_per_hour,
         .require_approval_for_medium_risk = request.require_approval_for_medium_risk,
         .block_high_risk_commands = request.block_high_risk_commands,

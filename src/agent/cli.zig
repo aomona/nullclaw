@@ -204,7 +204,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .autonomy = cfg.autonomy.level,
         .workspace_dir = cfg.workspace_dir,
         .workspace_only = cfg.autonomy.workspace_only,
-        .allowed_commands = if (cfg.autonomy.allowed_commands.len > 0) cfg.autonomy.allowed_commands else &security.default_allowed_commands,
+        .allowed_commands = security.resolveAllowedCommands(cfg.autonomy.level, cfg.autonomy.allowed_commands),
         .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
         .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
         .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
