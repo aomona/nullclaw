@@ -330,6 +330,8 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
           "token": "disc-token",
           "guild_id": "12345",
           "allow_from": ["user1"],
+          "require_mention": true,
+          "mention_exempt_channel_ids": ["123456789012345678"],
           "allow_bots": false
         }
       }

@@ -253,6 +253,8 @@ pub const DiscordConfig = struct {
     allow_bots: bool = false,
     allow_from: []const []const u8 = &.{},
     require_mention: bool = false,
+    /// Guild channel IDs where mentions are not required even when require_mention=true.
+    mention_exempt_channel_ids: []const []const u8 = &.{},
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
 };
 

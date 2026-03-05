@@ -20,6 +20,7 @@ pub const DiscordChannel = struct {
     // Optional gateway fields (have defaults so existing init works)
     allow_from: []const []const u8 = &.{},
     require_mention: bool = false,
+    mention_exempt_channel_ids: []const []const u8 = &.{},
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
     bus: ?*bus_mod.Bus = null,
 
@@ -83,6 +84,7 @@ pub const DiscordChannel = struct {
             .account_id = cfg.account_id,
             .allow_from = cfg.allow_from,
             .require_mention = cfg.require_mention,
+            .mention_exempt_channel_ids = cfg.mention_exempt_channel_ids,
             .intents = cfg.intents,
         };
     }
@@ -207,6 +209,13 @@ pub const DiscordChannel = struct {
         const mention2 = std.fmt.bufPrint(&buf2, "<@!{s}>", .{bot_user_id}) catch return false;
         if (std.mem.indexOf(u8, content, mention2) != null) return true;
 
+        return false;
+    }
+
+    fn isMentionExemptChannel(self: *const DiscordChannel, channel_id: []const u8) bool {
+        for (self.mention_exempt_channel_ids) |entry| {
+            if (std.mem.eql(u8, entry, channel_id)) return true;
+        }
         return false;
     }
 
@@ -822,7 +831,7 @@ pub const DiscordChannel = struct {
         }
 
         // Filter 2: require_mention for guild (non-DM) messages
-        if (self.require_mention and guild_id != null) {
+        if (self.require_mention and guild_id != null and !self.isMentionExemptChannel(channel_id)) {
             const bot_uid = self.bot_user_id orelse "";
             if (!isMentioned(content, bot_uid)) {
                 return;
@@ -1128,6 +1137,7 @@ test "discord initFromConfig passes all fields" {
         .allow_bots = true,
         .allow_from = &.{ "user1", "user2" },
         .require_mention = true,
+        .mention_exempt_channel_ids = &.{ "c-allow", "c-safe" },
         .intents = 512,
     };
     const ch = DiscordChannel.initFromConfig(std.testing.allocator, cfg);
@@ -1137,6 +1147,8 @@ test "discord initFromConfig passes all fields" {
     try std.testing.expectEqualStrings("discord-main", ch.account_id);
     try std.testing.expectEqual(@as(usize, 2), ch.allow_from.len);
     try std.testing.expect(ch.require_mention);
+    try std.testing.expectEqual(@as(usize, 2), ch.mention_exempt_channel_ids.len);
+    try std.testing.expectEqualStrings("c-allow", ch.mention_exempt_channel_ids[0]);
     try std.testing.expectEqual(@as(u32, 512), ch.intents);
 }
 
@@ -1233,6 +1245,37 @@ test "discord handleMessageCreate require_mention blocks unmentioned guild messa
 
     try ch.handleMessageCreate(parsed.value);
     try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
+}
+
+test "discord handleMessageCreate mention_exempt_channel_ids bypass require_mention" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .require_mention = true,
+        .mention_exempt_channel_ids = &.{"c-allow"},
+    });
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-1");
+    defer alloc.free(ch.bot_user_id.?);
+
+    const msg_json =
+        \\{"d":{"channel_id":"c-allow","guild_id":"g-2","content":"plain text","author":{"id":"u-2","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+
+    var msg = event_bus.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("discord", msg.channel);
+    try std.testing.expectEqualStrings("u-2", msg.sender_id);
+    try std.testing.expectEqualStrings("c-allow", msg.chat_id);
+    try std.testing.expectEqualStrings("plain text", msg.content);
 }
 
 test "discord dispatch sequence accepts lower values after session reset" {

@@ -3370,7 +3370,7 @@ test "parse telegram accounts keeps single custom account id" {
 test "parse discord accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"discord": {"accounts": {"main": {"token": "disc-tok", "guild_id": "12345", "allow_from": ["u1"], "require_mention": true}}}}}
+        \\{"channels": {"discord": {"accounts": {"main": {"token": "disc-tok", "guild_id": "12345", "allow_from": ["u1"], "require_mention": true, "mention_exempt_channel_ids": ["100", "200"]}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -3380,11 +3380,16 @@ test "parse discord accounts" {
     try std.testing.expectEqualStrings("disc-tok", dc.token);
     try std.testing.expectEqualStrings("12345", dc.guild_id.?);
     try std.testing.expect(dc.require_mention);
+    try std.testing.expectEqual(@as(usize, 2), dc.mention_exempt_channel_ids.len);
+    try std.testing.expectEqualStrings("100", dc.mention_exempt_channel_ids[0]);
+    try std.testing.expectEqualStrings("200", dc.mention_exempt_channel_ids[1]);
     allocator.free(dc.account_id);
     allocator.free(dc.token);
     allocator.free(dc.guild_id.?);
     for (dc.allow_from) |u| allocator.free(u);
     allocator.free(dc.allow_from);
+    for (dc.mention_exempt_channel_ids) |channel_id| allocator.free(channel_id);
+    allocator.free(dc.mention_exempt_channel_ids);
     allocator.free(cfg.channels.discord);
 }
 
