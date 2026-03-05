@@ -582,6 +582,16 @@ fn resolveSlackStatusTarget(meta: channel_adapters.InboundMetadata, chat_id: []c
     };
 }
 
+fn resolveDiscordReplyTarget(
+    allocator: std.mem.Allocator,
+    chat_id: []const u8,
+    meta: channel_adapters.InboundMetadata,
+) ?[]u8 {
+    const message_id = meta.message_id orelse return null;
+    if (chat_id.len == 0 or message_id.len == 0) return null;
+    return std.fmt.allocPrint(allocator, "channel:{s}:reply:{s}", .{ chat_id, message_id }) catch null;
+}
+
 fn resolveTypingRecipient(
     allocator: std.mem.Allocator,
     channel_name: []const u8,
@@ -684,6 +694,13 @@ fn inboundDispatcherThread(
         defer parsed_meta.deinit();
 
         const outbound_account_id = parsed_meta.fields.account_id;
+        const discord_reply_target = if (std.mem.eql(u8, msg.channel, "discord"))
+            resolveDiscordReplyTarget(allocator, msg.chat_id, parsed_meta.fields)
+        else
+            null;
+        defer if (discord_reply_target) |target| allocator.free(target);
+        const outbound_chat_id: []const u8 = if (discord_reply_target) |target| target else msg.chat_id;
+
         const routed_session_key = resolveInboundRouteSessionKeyWithMetadata(
             allocator,
             runtime.config,
@@ -749,9 +766,9 @@ fn inboundDispatcherThread(
                 else => "An error occurred. Try again.",
             };
             const err_out = if (outbound_account_id) |aid|
-                bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, err_msg) catch continue
+                bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, outbound_chat_id, err_msg) catch continue
             else
-                bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, err_msg) catch continue;
+                bus_mod.makeOutbound(allocator, msg.channel, outbound_chat_id, err_msg) catch continue;
             event_bus.publishOutbound(err_out) catch {
                 err_out.deinit(allocator);
             };
@@ -760,9 +777,9 @@ fn inboundDispatcherThread(
         defer allocator.free(reply);
 
         const out = (if (outbound_account_id) |aid|
-            bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, reply)
+            bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, outbound_chat_id, reply)
         else
-            bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, reply)) catch |err| {
+            bus_mod.makeOutbound(allocator, msg.channel, outbound_chat_id, reply)) catch |err| {
             log.err("inbound dispatch makeOutbound failed: {}", .{err});
             continue;
         };
@@ -1690,6 +1707,20 @@ test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" 
     }, "C123");
     try std.testing.expect(with_message_only != null);
     try std.testing.expectEqualStrings("1700.1", with_message_only.?.thread_ts);
+}
+
+test "resolveDiscordReplyTarget builds reply target from message id" {
+    const target = resolveDiscordReplyTarget(std.testing.allocator, "1234567890", .{
+        .message_id = "9988776655",
+    });
+    try std.testing.expect(target != null);
+    defer std.testing.allocator.free(target.?);
+    try std.testing.expectEqualStrings("channel:1234567890:reply:9988776655", target.?);
+}
+
+test "resolveDiscordReplyTarget returns null when message id missing" {
+    const target = resolveDiscordReplyTarget(std.testing.allocator, "1234567890", .{});
+    try std.testing.expect(target == null);
 }
 
 test "hasSupervisedChannels true for nostr" {

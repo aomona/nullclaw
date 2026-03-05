@@ -254,6 +254,7 @@ pub const DiscordConfig = struct {
     allow_from: []const []const u8 = &.{},
     require_mention: bool = false,
     /// Guild channel IDs where mentions are not required even when require_mention=true.
+    /// For forum/media, use the parent forum channel ID.
     mention_exempt_channel_ids: []const []const u8 = &.{},
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
 };

@@ -26,6 +26,8 @@ pub const DiscordChannel = struct {
 
     typing_mu: std.Thread.Mutex = .{},
     typing_handles: std.StringHashMapUnmanaged(*TypingTask) = .empty,
+    thread_parent_ids: std.StringHashMapUnmanaged([]u8) = .empty,
+    forum_parent_ids: std.StringHashMapUnmanaged(void) = .empty,
 
     // Gateway state
     running: Atomic(bool) = Atomic(bool).init(false),
@@ -48,9 +50,20 @@ pub const DiscordChannel = struct {
     pub const GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
     const TYPING_INTERVAL_NS: u64 = 8 * std.time.ns_per_s;
     const TYPING_SLEEP_STEP_NS: u64 = 100 * std.time.ns_per_ms;
+    const CHANNEL_TYPE_GUILD_NEWS_THREAD: i64 = 10;
+    const CHANNEL_TYPE_GUILD_PUBLIC_THREAD: i64 = 11;
+    const CHANNEL_TYPE_GUILD_PRIVATE_THREAD: i64 = 12;
+    const CHANNEL_TYPE_GUILD_FORUM: i64 = 15;
+    const CHANNEL_TYPE_GUILD_MEDIA: i64 = 16;
+
     const InvalidSessionAction = enum {
         identify,
         resume_session,
+    };
+
+    const ParsedTarget = struct {
+        channel_id: []const u8,
+        reply_message_id: ?[]const u8 = null,
     };
 
     const TypingTask = struct {
@@ -219,14 +232,209 @@ pub const DiscordChannel = struct {
         return false;
     }
 
+    fn trimPrefixIgnoreCase(s: []const u8, prefix: []const u8) ?[]const u8 {
+        if (s.len < prefix.len) return null;
+        if (!std.ascii.eqlIgnoreCase(s[0..prefix.len], prefix)) return null;
+        return s[prefix.len..];
+    }
+
+    fn parseTarget(target: []const u8) !ParsedTarget {
+        var t = std.mem.trim(u8, target, " \t\r\n");
+        if (t.len == 0) return error.InvalidTarget;
+
+        var reply_message_id: ?[]const u8 = null;
+        if (std.mem.indexOf(u8, t, ":reply:")) |idx| {
+            const raw_reply = std.mem.trim(u8, t[idx + ":reply:".len ..], " \t\r\n");
+            if (raw_reply.len == 0) return error.InvalidTarget;
+            reply_message_id = raw_reply;
+            t = std.mem.trim(u8, t[0..idx], " \t\r\n");
+        }
+
+        if (trimPrefixIgnoreCase(t, "channel:")) |rest| {
+            t = std.mem.trim(u8, rest, " \t\r\n");
+        }
+        if (t.len == 0) return error.InvalidTarget;
+
+        return .{ .channel_id = t, .reply_message_id = reply_message_id };
+    }
+
+    fn isThreadChannelType(channel_type: i64) bool {
+        return channel_type == CHANNEL_TYPE_GUILD_NEWS_THREAD or
+            channel_type == CHANNEL_TYPE_GUILD_PUBLIC_THREAD or
+            channel_type == CHANNEL_TYPE_GUILD_PRIVATE_THREAD;
+    }
+
+    fn isForumChannelType(channel_type: i64) bool {
+        return channel_type == CHANNEL_TYPE_GUILD_FORUM or channel_type == CHANNEL_TYPE_GUILD_MEDIA;
+    }
+
+    fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+        const val = obj.get(key) orelse return null;
+        return if (val == .string) val.string else null;
+    }
+
+    fn jsonInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
+        const val = obj.get(key) orelse return null;
+        return if (val == .integer) val.integer else null;
+    }
+
+    fn upsertThreadParent(self: *DiscordChannel, thread_id: []const u8, parent_id: []const u8) !void {
+        if (self.thread_parent_ids.getPtr(thread_id)) |existing_parent| {
+            if (!std.mem.eql(u8, existing_parent.*, parent_id)) {
+                self.allocator.free(existing_parent.*);
+                existing_parent.* = try self.allocator.dupe(u8, parent_id);
+            }
+            return;
+        }
+
+        const thread_id_copy = try self.allocator.dupe(u8, thread_id);
+        errdefer self.allocator.free(thread_id_copy);
+        const parent_id_copy = try self.allocator.dupe(u8, parent_id);
+        errdefer self.allocator.free(parent_id_copy);
+
+        try self.thread_parent_ids.put(self.allocator, thread_id_copy, parent_id_copy);
+    }
+
+    fn removeThreadParent(self: *DiscordChannel, thread_id: []const u8) void {
+        if (self.thread_parent_ids.fetchRemove(thread_id)) |entry| {
+            self.allocator.free(@constCast(entry.key));
+            self.allocator.free(entry.value);
+        }
+    }
+
+    fn upsertForumParent(self: *DiscordChannel, channel_id: []const u8) !void {
+        if (self.forum_parent_ids.get(channel_id) != null) return;
+
+        const channel_id_copy = try self.allocator.dupe(u8, channel_id);
+        errdefer self.allocator.free(channel_id_copy);
+        try self.forum_parent_ids.put(self.allocator, channel_id_copy, {});
+    }
+
+    fn removeForumParent(self: *DiscordChannel, channel_id: []const u8) void {
+        if (self.forum_parent_ids.fetchRemove(channel_id)) |entry| {
+            self.allocator.free(@constCast(entry.key));
+        }
+    }
+
+    fn cacheChannelObject(self: *DiscordChannel, channel_obj: std.json.ObjectMap) !void {
+        const channel_id = jsonString(channel_obj, "id") orelse return;
+        const channel_type = jsonInt(channel_obj, "type") orelse return;
+
+        if (isForumChannelType(channel_type)) {
+            try self.upsertForumParent(channel_id);
+        } else {
+            self.removeForumParent(channel_id);
+        }
+
+        if (isThreadChannelType(channel_type)) {
+            const parent_id = jsonString(channel_obj, "parent_id") orelse return;
+            try self.upsertThreadParent(channel_id, parent_id);
+        }
+    }
+
+    fn cacheChannelsFromArray(self: *DiscordChannel, channels_val: std.json.Value) void {
+        if (channels_val != .array) return;
+        for (channels_val.array.items) |channel_val| {
+            if (channel_val != .object) continue;
+            self.cacheChannelObject(channel_val.object) catch |err| {
+                log.warn("Discord: failed to cache channel object: {}", .{err});
+            };
+        }
+    }
+
+    const ThreadContext = struct {
+        is_thread: bool = false,
+        parent_id: ?[]const u8 = null,
+        is_forum_thread: bool = false,
+    };
+
+    fn resolveThreadContext(self: *DiscordChannel, channel_id: []const u8, d_obj: std.json.ObjectMap) ThreadContext {
+        var ctx = ThreadContext{};
+
+        if (self.thread_parent_ids.get(channel_id)) |parent_id| {
+            ctx.is_thread = true;
+            ctx.parent_id = parent_id;
+            ctx.is_forum_thread = self.forum_parent_ids.get(parent_id) != null;
+            return ctx;
+        }
+
+        if (d_obj.get("thread")) |thread_val| {
+            if (thread_val == .object) {
+                const thread_id = jsonString(thread_val.object, "id");
+                const parent_id = jsonString(thread_val.object, "parent_id");
+                if (thread_id != null and parent_id != null and std.mem.eql(u8, thread_id.?, channel_id)) {
+                    self.cacheChannelObject(thread_val.object) catch {};
+                    ctx.is_thread = true;
+                    if (self.thread_parent_ids.get(channel_id)) |cached_parent_id| {
+                        ctx.parent_id = cached_parent_id;
+                        ctx.is_forum_thread = self.forum_parent_ids.get(cached_parent_id) != null;
+                    } else {
+                        ctx.parent_id = parent_id.?;
+                        ctx.is_forum_thread = self.forum_parent_ids.get(parent_id.?) != null;
+                    }
+                    return ctx;
+                }
+            }
+        }
+
+        if (d_obj.get("position")) |position_val| {
+            switch (position_val) {
+                .integer, .float => ctx.is_thread = true,
+                else => {},
+            }
+        }
+
+        return ctx;
+    }
+
+    fn mentionRequiredForMessage(
+        self: *DiscordChannel,
+        channel_id: []const u8,
+        guild_id: ?[]const u8,
+        thread_ctx: ThreadContext,
+    ) bool {
+        if (!self.require_mention or guild_id == null) return false;
+
+        if (thread_ctx.is_thread) {
+            if (thread_ctx.parent_id) |parent_id| {
+                if (self.isMentionExemptChannel(parent_id)) return false;
+                if (thread_ctx.is_forum_thread) return true;
+            }
+            return false;
+        }
+
+        return !self.isMentionExemptChannel(channel_id);
+    }
+
+    fn clearThreadCaches(self: *DiscordChannel) void {
+        var thread_it = self.thread_parent_ids.iterator();
+        while (thread_it.next()) |entry| {
+            self.allocator.free(@constCast(entry.key_ptr.*));
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.thread_parent_ids.deinit(self.allocator);
+        self.thread_parent_ids = .empty;
+
+        var forum_it = self.forum_parent_ids.iterator();
+        while (forum_it.next()) |entry| {
+            self.allocator.free(@constCast(entry.key_ptr.*));
+        }
+        self.forum_parent_ids.deinit(self.allocator);
+        self.forum_parent_ids = .empty;
+    }
+
     // ── Channel vtable ──────────────────────────────────────────────
 
     /// Send a message to a Discord channel via REST API.
     /// Splits at MAX_MESSAGE_LEN (2000 chars).
-    pub fn sendMessage(self: *DiscordChannel, channel_id: []const u8, text: []const u8) !void {
+    pub fn sendMessage(self: *DiscordChannel, target: []const u8, text: []const u8) !void {
+        const parsed_target = try parseTarget(target);
+
         var it = root.splitMessage(text, MAX_MESSAGE_LEN);
+        var first = true;
         while (it.next()) |chunk| {
-            try self.sendChunk(channel_id, chunk);
+            try self.sendChunk(parsed_target.channel_id, chunk, if (first) parsed_target.reply_message_id else null);
+            first = false;
         }
     }
 
@@ -323,17 +531,28 @@ pub const DiscordChannel = struct {
         }
     }
 
-    fn sendChunk(self: *DiscordChannel, channel_id: []const u8, text: []const u8) !void {
+    fn buildSendBody(allocator: std.mem.Allocator, text: []const u8, reply_message_id: ?[]const u8) ![]u8 {
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(allocator);
+
+        try body_list.appendSlice(allocator, "{\"content\":");
+        try root.json_util.appendJsonString(&body_list, allocator, text);
+        if (reply_message_id) |message_id| {
+            try body_list.appendSlice(allocator, ",\"message_reference\":{\"message_id\":");
+            try root.json_util.appendJsonString(&body_list, allocator, message_id);
+            try body_list.appendSlice(allocator, ",\"fail_if_not_exists\":false}");
+        }
+        try body_list.appendSlice(allocator, "}");
+
+        return try body_list.toOwnedSlice(allocator);
+    }
+
+    fn sendChunk(self: *DiscordChannel, channel_id: []const u8, text: []const u8, reply_message_id: ?[]const u8) !void {
         var url_buf: [256]u8 = undefined;
         const url = try sendUrl(&url_buf, channel_id);
 
-        // Build JSON body: {"content":"..."}
-        var body_list: std.ArrayListUnmanaged(u8) = .empty;
-        defer body_list.deinit(self.allocator);
-
-        try body_list.appendSlice(self.allocator, "{\"content\":");
-        try root.json_util.appendJsonString(&body_list, self.allocator, text);
-        try body_list.appendSlice(self.allocator, "}");
+        const body = try buildSendBody(self.allocator, text, reply_message_id);
+        defer self.allocator.free(body);
 
         // Build auth header value: "Authorization: Bot <token>"
         var auth_buf: [512]u8 = undefined;
@@ -341,7 +560,7 @@ pub const DiscordChannel = struct {
         try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
         const auth_header = auth_fbs.getWritten();
 
-        const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
+        const resp = root.http_util.curlPost(self.allocator, url, body, &.{auth_header}) catch |err| {
             log.err("Discord API POST failed: {}", .{err});
             return error.DiscordApiError;
         };
@@ -387,6 +606,7 @@ pub const DiscordChannel = struct {
             self.allocator.free(u);
             self.bot_user_id = null;
         }
+        self.clearThreadCaches();
     }
 
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
@@ -627,6 +847,30 @@ pub const DiscordChannel = struct {
                     self.handleReady(root_val) catch |err| {
                         log.warn("Discord: handleReady error: {}", .{err});
                     };
+                } else if (std.mem.eql(u8, event_type, "GUILD_CREATE")) {
+                    self.handleGuildCreate(root_val) catch |err| {
+                        log.warn("Discord: handleGuildCreate error: {}", .{err});
+                    };
+                } else if (std.mem.eql(u8, event_type, "CHANNEL_CREATE") or std.mem.eql(u8, event_type, "CHANNEL_UPDATE")) {
+                    self.handleChannelUpsert(root_val) catch |err| {
+                        log.warn("Discord: handleChannelUpsert error: {}", .{err});
+                    };
+                } else if (std.mem.eql(u8, event_type, "CHANNEL_DELETE")) {
+                    self.handleChannelDelete(root_val) catch |err| {
+                        log.warn("Discord: handleChannelDelete error: {}", .{err});
+                    };
+                } else if (std.mem.eql(u8, event_type, "THREAD_CREATE") or std.mem.eql(u8, event_type, "THREAD_UPDATE")) {
+                    self.handleChannelUpsert(root_val) catch |err| {
+                        log.warn("Discord: handleThreadUpsert error: {}", .{err});
+                    };
+                } else if (std.mem.eql(u8, event_type, "THREAD_DELETE")) {
+                    self.handleThreadDelete(root_val) catch |err| {
+                        log.warn("Discord: handleThreadDelete error: {}", .{err});
+                    };
+                } else if (std.mem.eql(u8, event_type, "THREAD_LIST_SYNC")) {
+                    self.handleThreadListSync(root_val) catch |err| {
+                        log.warn("Discord: handleThreadListSync error: {}", .{err});
+                    };
                 } else if (std.mem.eql(u8, event_type, "MESSAGE_CREATE")) {
                     self.handleMessageCreate(root_val) catch |err| {
                         log.warn("Discord: handleMessageCreate error: {}", .{err});
@@ -756,20 +1000,65 @@ pub const DiscordChannel = struct {
         log.info("Discord READY: session_id={s}", .{self.session_id orelse "<none>"});
     }
 
-    /// Handle MESSAGE_CREATE event and publish to bus if filters pass.
-    fn handleMessageCreate(self: *DiscordChannel, root_val: std.json.Value) !void {
-        if (root_val != .object) return;
+    fn dispatchPayloadObject(root_val: std.json.Value, event_name: []const u8) ?std.json.ObjectMap {
+        if (root_val != .object) return null;
         const d_val = root_val.object.get("d") orelse {
-            log.warn("Discord MESSAGE_CREATE: missing 'd' field", .{});
-            return;
+            log.warn("Discord {s}: missing 'd' field", .{event_name});
+            return null;
         };
-        const d_obj = switch (d_val) {
-            .object => |o| o,
+        return switch (d_val) {
+            .object => |d_obj| d_obj,
             else => {
-                log.warn("Discord MESSAGE_CREATE: 'd' is not an object", .{});
-                return;
+                log.warn("Discord {s}: 'd' is not an object", .{event_name});
+                return null;
             },
         };
+    }
+
+    fn handleGuildCreate(self: *DiscordChannel, root_val: std.json.Value) !void {
+        const d_obj = dispatchPayloadObject(root_val, "GUILD_CREATE") orelse return;
+        if (d_obj.get("channels")) |channels_val| {
+            self.cacheChannelsFromArray(channels_val);
+        }
+        if (d_obj.get("threads")) |threads_val| {
+            self.cacheChannelsFromArray(threads_val);
+        }
+    }
+
+    fn handleChannelUpsert(self: *DiscordChannel, root_val: std.json.Value) !void {
+        const d_obj = dispatchPayloadObject(root_val, "CHANNEL_UPSERT") orelse return;
+        try self.cacheChannelObject(d_obj);
+    }
+
+    fn handleChannelDelete(self: *DiscordChannel, root_val: std.json.Value) !void {
+        const d_obj = dispatchPayloadObject(root_val, "CHANNEL_DELETE") orelse return;
+        const channel_id = jsonString(d_obj, "id") orelse return;
+        const channel_type = jsonInt(d_obj, "type") orelse return;
+
+        if (isThreadChannelType(channel_type)) {
+            self.removeThreadParent(channel_id);
+        }
+        if (isForumChannelType(channel_type)) {
+            self.removeForumParent(channel_id);
+        }
+    }
+
+    fn handleThreadDelete(self: *DiscordChannel, root_val: std.json.Value) !void {
+        const d_obj = dispatchPayloadObject(root_val, "THREAD_DELETE") orelse return;
+        const thread_id = jsonString(d_obj, "id") orelse return;
+        self.removeThreadParent(thread_id);
+    }
+
+    fn handleThreadListSync(self: *DiscordChannel, root_val: std.json.Value) !void {
+        const d_obj = dispatchPayloadObject(root_val, "THREAD_LIST_SYNC") orelse return;
+        if (d_obj.get("threads")) |threads_val| {
+            self.cacheChannelsFromArray(threads_val);
+        }
+    }
+
+    /// Handle MESSAGE_CREATE event and publish to bus if filters pass.
+    fn handleMessageCreate(self: *DiscordChannel, root_val: std.json.Value) !void {
+        const d_obj = dispatchPayloadObject(root_val, "MESSAGE_CREATE") orelse return;
 
         // Extract channel_id
         const channel_id: []const u8 = if (d_obj.get("channel_id")) |v| switch (v) {
@@ -782,6 +1071,12 @@ pub const DiscordChannel = struct {
             log.warn("Discord MESSAGE_CREATE: missing 'channel_id'", .{});
             return;
         };
+
+        // Extract message id (for reply semantics)
+        const message_id: ?[]const u8 = if (d_obj.get("id")) |v| switch (v) {
+            .string => |s| s,
+            else => null,
+        } else null;
 
         // Extract content
         const content: []const u8 = if (d_obj.get("content")) |v| switch (v) {
@@ -830,8 +1125,12 @@ pub const DiscordChannel = struct {
             return;
         }
 
-        // Filter 2: require_mention for guild (non-DM) messages
-        if (self.require_mention and guild_id != null and !self.isMentionExemptChannel(channel_id)) {
+        const thread_ctx = resolveThreadContext(self, channel_id, d_obj);
+
+        // Filter 2: require_mention in guild messages.
+        // - Normal threads: mentions are optional.
+        // - Forum/media threads: mention exemption is controlled by parent forum ID in mention_exempt_channel_ids.
+        if (mentionRequiredForMessage(self, channel_id, guild_id, thread_ctx)) {
             const bot_uid = self.bot_user_id orelse "";
             if (!isMentioned(content, bot_uid)) {
                 return;
@@ -912,9 +1211,19 @@ pub const DiscordChannel = struct {
         try mw.print("{{\"is_dm\":{s}", .{if (guild_id == null) "true" else "false"});
         try mw.writeAll(",\"account_id\":");
         try root.appendJsonStringW(mw, self.account_id);
+        try mw.writeAll(",\"channel_id\":");
+        try root.appendJsonStringW(mw, channel_id);
         if (guild_id) |gid| {
             try mw.writeAll(",\"guild_id\":");
             try root.appendJsonStringW(mw, gid);
+        }
+        if (message_id) |mid| {
+            try mw.writeAll(",\"message_id\":");
+            try root.appendJsonStringW(mw, mid);
+        }
+        if (thread_ctx.parent_id) |parent_id| {
+            try mw.writeAll(",\"parent_channel_id\":");
+            try root.appendJsonStringW(mw, parent_id);
         }
         try mw.writeByte('}');
 
@@ -1123,6 +1432,35 @@ test "discord isMentioned with user id" {
     try std.testing.expect(!DiscordChannel.isMentioned("<@999999> hello", "123456"));
 }
 
+test "discord parseTarget supports channel prefix and reply suffix" {
+    const plain = try DiscordChannel.parseTarget("123456");
+    try std.testing.expectEqualStrings("123456", plain.channel_id);
+    try std.testing.expect(plain.reply_message_id == null);
+
+    const prefixed = try DiscordChannel.parseTarget("channel:987654");
+    try std.testing.expectEqualStrings("987654", prefixed.channel_id);
+    try std.testing.expect(prefixed.reply_message_id == null);
+
+    const reply = try DiscordChannel.parseTarget("channel:987654:reply:112233");
+    try std.testing.expectEqualStrings("987654", reply.channel_id);
+    try std.testing.expectEqualStrings("112233", reply.reply_message_id.?);
+}
+
+test "discord buildSendBody includes message_reference for replies" {
+    const alloc = std.testing.allocator;
+
+    const plain = try DiscordChannel.buildSendBody(alloc, "hello", null);
+    defer alloc.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "\"content\":\"hello\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "\"message_reference\"") == null);
+
+    const reply = try DiscordChannel.buildSendBody(alloc, "hello", "msg-42");
+    defer alloc.free(reply);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\"message_reference\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\"message_id\":\"msg-42\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\"fail_if_not_exists\":false") != null);
+}
+
 test "discord intents default" {
     const ch = DiscordChannel.init(std.testing.allocator, "tok", null, false);
     try std.testing.expectEqual(@as(u32, 37377), ch.intents);
@@ -1164,7 +1502,7 @@ test "discord handleMessageCreate publishes inbound guild message with metadata"
     ch.setBus(&event_bus);
 
     const msg_json =
-        \\{"d":{"channel_id":"c-1","guild_id":"g-1","content":"hello","author":{"id":"u-1","bot":false}}}
+        \\{"d":{"id":"m-1","channel_id":"c-1","guild_id":"g-1","content":"hello","author":{"id":"u-1","bot":false}}}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
     defer parsed.deinit();
@@ -1185,9 +1523,13 @@ test "discord handleMessageCreate publishes inbound guild message with metadata"
     try std.testing.expect(meta.value == .object);
     try std.testing.expect(meta.value.object.get("account_id") != null);
     try std.testing.expect(meta.value.object.get("is_dm") != null);
+    try std.testing.expect(meta.value.object.get("channel_id") != null);
+    try std.testing.expect(meta.value.object.get("message_id") != null);
     try std.testing.expect(meta.value.object.get("guild_id") != null);
     try std.testing.expectEqualStrings("dc-main", meta.value.object.get("account_id").?.string);
     try std.testing.expect(!meta.value.object.get("is_dm").?.bool);
+    try std.testing.expectEqualStrings("c-1", meta.value.object.get("channel_id").?.string);
+    try std.testing.expectEqualStrings("m-1", meta.value.object.get("message_id").?.string);
     try std.testing.expectEqualStrings("g-1", meta.value.object.get("guild_id").?.string);
 }
 
@@ -1276,6 +1618,123 @@ test "discord handleMessageCreate mention_exempt_channel_ids bypass require_ment
     try std.testing.expectEqualStrings("u-2", msg.sender_id);
     try std.testing.expectEqualStrings("c-allow", msg.chat_id);
     try std.testing.expectEqualStrings("plain text", msg.content);
+}
+
+test "discord handleMessageCreate thread bypasses require_mention" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .require_mention = true,
+    });
+    defer ch.clearThreadCaches();
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-1");
+    defer alloc.free(ch.bot_user_id.?);
+
+    const thread_json =
+        \\{"d":{"id":"thread-1","parent_id":"text-1","type":11}}
+    ;
+    const thread_parsed = try std.json.parseFromSlice(std.json.Value, alloc, thread_json, .{});
+    defer thread_parsed.deinit();
+    try ch.handleChannelUpsert(thread_parsed.value);
+
+    const msg_json =
+        \\{"d":{"id":"m-thread-1","channel_id":"thread-1","guild_id":"g-2","content":"plain text","position":1,"author":{"id":"u-2","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+
+    var msg = event_bus.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("thread-1", msg.chat_id);
+}
+
+test "discord handleMessageCreate forum thread requires mention unless parent exempt" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .require_mention = true,
+    });
+    defer ch.clearThreadCaches();
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-1");
+    defer alloc.free(ch.bot_user_id.?);
+
+    const forum_json =
+        \\{"d":{"id":"forum-1","type":15}}
+    ;
+    const forum_parsed = try std.json.parseFromSlice(std.json.Value, alloc, forum_json, .{});
+    defer forum_parsed.deinit();
+    try ch.handleChannelUpsert(forum_parsed.value);
+
+    const thread_json =
+        \\{"d":{"id":"forum-thread-1","parent_id":"forum-1","type":11}}
+    ;
+    const thread_parsed = try std.json.parseFromSlice(std.json.Value, alloc, thread_json, .{});
+    defer thread_parsed.deinit();
+    try ch.handleChannelUpsert(thread_parsed.value);
+
+    const msg_json =
+        \\{"d":{"id":"m-forum-1","channel_id":"forum-thread-1","guild_id":"g-2","content":"plain text","position":1,"author":{"id":"u-2","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
+}
+
+test "discord handleMessageCreate forum thread bypasses mention when parent is exempt" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .require_mention = true,
+        .mention_exempt_channel_ids = &.{"forum-1"},
+    });
+    defer ch.clearThreadCaches();
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-1");
+    defer alloc.free(ch.bot_user_id.?);
+
+    const forum_json =
+        \\{"d":{"id":"forum-1","type":15}}
+    ;
+    const forum_parsed = try std.json.parseFromSlice(std.json.Value, alloc, forum_json, .{});
+    defer forum_parsed.deinit();
+    try ch.handleChannelUpsert(forum_parsed.value);
+
+    const thread_json =
+        \\{"d":{"id":"forum-thread-2","parent_id":"forum-1","type":11}}
+    ;
+    const thread_parsed = try std.json.parseFromSlice(std.json.Value, alloc, thread_json, .{});
+    defer thread_parsed.deinit();
+    try ch.handleChannelUpsert(thread_parsed.value);
+
+    const msg_json =
+        \\{"d":{"id":"m-forum-2","channel_id":"forum-thread-2","guild_id":"g-2","content":"plain text","position":1,"author":{"id":"u-2","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+
+    var msg = event_bus.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("forum-thread-2", msg.chat_id);
 }
 
 test "discord dispatch sequence accepts lower values after session reset" {
