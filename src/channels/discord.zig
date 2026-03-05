@@ -1120,6 +1120,13 @@ pub const DiscordChannel = struct {
             else => false,
         } else false;
 
+        // Never process messages sent by this bot account.
+        if (self.bot_user_id) |bot_uid| {
+            if (std.mem.eql(u8, author_id, bot_uid)) {
+                return;
+            }
+        }
+
         // Filter 1: bot author
         if (author_is_bot and !self.allow_bots) {
             return;
@@ -1618,6 +1625,30 @@ test "discord handleMessageCreate mention_exempt_channel_ids bypass require_ment
     try std.testing.expectEqualStrings("u-2", msg.sender_id);
     try std.testing.expectEqualStrings("c-allow", msg.chat_id);
     try std.testing.expectEqualStrings("plain text", msg.content);
+}
+
+test "discord handleMessageCreate ignores own bot messages" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .allow_bots = true,
+    });
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-1");
+    defer alloc.free(ch.bot_user_id.?);
+
+    const msg_json =
+        \\{"d":{"id":"m-self-1","channel_id":"c-2","guild_id":"g-2","content":"loop?","author":{"id":"bot-1","bot":true}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
 }
 
 test "discord handleMessageCreate thread bypasses require_mention" {
