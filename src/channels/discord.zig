@@ -29,6 +29,11 @@ pub const DiscordChannel = struct {
 
     typing_mu: std.Thread.Mutex = .{},
     typing_handles: std.StringHashMapUnmanaged(*TypingTask) = .empty,
+    outbound_event_mu: std.Thread.Mutex = .{},
+    outbound_event_cv: std.Thread.Condition = .{},
+    outbound_events: std.ArrayListUnmanaged(QueuedOutboundEvent) = .empty,
+    outbound_worker_stop: bool = false,
+    outbound_worker: ?std.Thread = null,
     draft_mu: std.Thread.Mutex = .{},
     draft_states: std.StringHashMapUnmanaged(DraftState) = .empty,
     thread_parent_ids: std.StringHashMapUnmanaged([]u8) = .empty,
@@ -122,6 +127,17 @@ pub const DiscordChannel = struct {
             for (self.requests.items) |req| req.deinit(allocator);
             self.requests.deinit(allocator);
             self.* = .{};
+        }
+    };
+
+    const QueuedOutboundEvent = struct {
+        target: []u8,
+        message: []u8,
+        stage: root.Channel.OutboundStage,
+
+        fn deinit(self: *const QueuedOutboundEvent, allocator: std.mem.Allocator) void {
+            allocator.free(self.target);
+            allocator.free(self.message);
         }
     };
 
@@ -547,6 +563,12 @@ pub const DiscordChannel = struct {
         }
     }
 
+    fn deinitOutboundEvents(self: *DiscordChannel) void {
+        for (self.outbound_events.items) |event| event.deinit(self.allocator);
+        self.outbound_events.deinit(self.allocator);
+        self.outbound_events = .empty;
+    }
+
     fn recordTestRequest(
         self: *DiscordChannel,
         kind: TestRequestKind,
@@ -915,11 +937,70 @@ pub const DiscordChannel = struct {
         try self.sendMessage(target, message);
     }
 
+    fn processOutboundEvent(self: *DiscordChannel, target: []const u8, message: []const u8, stage: root.Channel.OutboundStage) !void {
+        switch (stage) {
+            .chunk => try self.handleStreamingChunk(target, message),
+            .final => try self.handleStreamingFinal(target, message),
+        }
+    }
+
+    fn enqueueOutboundEvent(self: *DiscordChannel, target: []const u8, message: []const u8, stage: root.Channel.OutboundStage) !void {
+        const target_copy = try self.allocator.dupe(u8, target);
+        errdefer self.allocator.free(target_copy);
+        const message_copy = try self.allocator.dupe(u8, message);
+        errdefer self.allocator.free(message_copy);
+
+        self.outbound_event_mu.lock();
+        defer self.outbound_event_mu.unlock();
+        try self.outbound_events.append(self.allocator, .{
+            .target = target_copy,
+            .message = message_copy,
+            .stage = stage,
+        });
+        self.outbound_event_cv.signal();
+    }
+
+    fn outboundWorkerLoop(self: *DiscordChannel) void {
+        while (true) {
+            self.outbound_event_mu.lock();
+            while (self.outbound_events.items.len == 0 and !self.outbound_worker_stop) {
+                self.outbound_event_cv.wait(&self.outbound_event_mu);
+            }
+
+            if (self.outbound_events.items.len == 0 and self.outbound_worker_stop) {
+                self.outbound_event_mu.unlock();
+                break;
+            }
+
+            const event = self.outbound_events.orderedRemove(0);
+            self.outbound_event_mu.unlock();
+            defer event.deinit(self.allocator);
+
+            self.processOutboundEvent(event.target, event.message, event.stage) catch |err| {
+                log.err("Discord outbound worker failed: {}", .{err});
+            };
+        }
+    }
+
     // ── Gateway ──────────────────────────────────────────────────────
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
         self.running.store(true, .release);
+        self.outbound_event_mu.lock();
+        self.outbound_worker_stop = false;
+        self.outbound_event_mu.unlock();
+        self.outbound_worker = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, outboundWorkerLoop, .{self});
+        errdefer {
+            self.outbound_event_mu.lock();
+            self.outbound_worker_stop = true;
+            self.outbound_event_mu.unlock();
+            self.outbound_event_cv.broadcast();
+            if (self.outbound_worker) |t| {
+                t.join();
+                self.outbound_worker = null;
+            }
+        }
         self.gateway_thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, gatewayLoop, .{self});
     }
 
@@ -928,7 +1009,10 @@ pub const DiscordChannel = struct {
         self.running.store(false, .release);
         self.heartbeat_stop.store(true, .release);
         self.stopAllTyping();
-        self.deinitDraftStates();
+        self.outbound_event_mu.lock();
+        self.outbound_worker_stop = true;
+        self.outbound_event_mu.unlock();
+        self.outbound_event_cv.broadcast();
         // Close socket to unblock blocking read
         const fd = self.ws_fd.load(.acquire);
         if (fd != invalid_socket) {
@@ -942,6 +1026,12 @@ pub const DiscordChannel = struct {
             t.join();
             self.gateway_thread = null;
         }
+        if (self.outbound_worker) |t| {
+            t.join();
+            self.outbound_worker = null;
+        }
+        self.deinitDraftStates();
+        self.deinitOutboundEvents();
         // Free session state
         if (self.session_id) |s| {
             self.allocator.free(s);
@@ -972,10 +1062,11 @@ pub const DiscordChannel = struct {
         stage: root.Channel.OutboundStage,
     ) anyerror!void {
         const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
-        switch (stage) {
-            .chunk => try self.handleStreamingChunk(target, message),
-            .final => try self.handleStreamingFinal(target, message),
+        if (builtin.is_test or self.outbound_worker == null) {
+            try self.processOutboundEvent(target, message, stage);
+            return;
         }
+        try self.enqueueOutboundEvent(target, message, stage);
     }
 
     fn vtableName(ptr: *anyopaque) []const u8 {
