@@ -7,8 +7,9 @@ const websocket = @import("../websocket.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.discord);
-const DRAFT_FLUSH_MIN_INTERVAL_MS: i64 = 1000;
-const REST_REQUEST_MIN_INTERVAL_NS: i128 = std.time.ns_per_s;
+const DRAFT_FLUSH_MIN_DELTA_BYTES: usize = 64;
+const DRAFT_FLUSH_MIN_INTERVAL_MS: i64 = 400;
+const MAX_RATE_LIMIT_RETRIES: usize = 5;
 
 /// Discord channel — connects via WebSocket gateway, sends via REST API.
 /// Splits messages at 2000 chars (Discord limit).
@@ -28,8 +29,6 @@ pub const DiscordChannel = struct {
 
     typing_mu: std.Thread.Mutex = .{},
     typing_handles: std.StringHashMapUnmanaged(*TypingTask) = .empty,
-    rest_request_mu: std.Thread.Mutex = .{},
-    last_rest_request_started_ns: i128 = 0,
     draft_mu: std.Thread.Mutex = .{},
     draft_states: std.StringHashMapUnmanaged(DraftState) = .empty,
     thread_parent_ids: std.StringHashMapUnmanaged([]u8) = .empty,
@@ -304,20 +303,6 @@ pub const DiscordChannel = struct {
     fn firstMessageChunk(text: []const u8) []const u8 {
         var it = root.splitMessage(text, MAX_MESSAGE_LEN);
         return it.next() orelse "";
-    }
-
-    fn nextRestRequestDelayNs(last_request_started_ns: i128, now_ns: i128) u64 {
-        if (last_request_started_ns <= 0) return 0;
-        const elapsed_ns = now_ns - last_request_started_ns;
-        if (elapsed_ns >= REST_REQUEST_MIN_INTERVAL_NS) return 0;
-        return @intCast(REST_REQUEST_MIN_INTERVAL_NS - @max(elapsed_ns, 0));
-    }
-
-    fn waitForRestRequestSlot(self: *DiscordChannel) void {
-        const now_ns = std.time.nanoTimestamp();
-        const delay_ns = nextRestRequestDelayNs(self.last_rest_request_started_ns, now_ns);
-        if (delay_ns > 0) std.Thread.sleep(delay_ns);
-        self.last_rest_request_started_ns = std.time.nanoTimestamp();
     }
 
     fn parseTarget(target: []const u8) !ParsedTarget {
@@ -607,6 +592,54 @@ pub const DiscordChannel = struct {
         return error.DiscordApiError;
     }
 
+    fn parseRetryAfterNs(allocator: std.mem.Allocator, response_body: []const u8) ?u64 {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, response_body, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const retry_val = parsed.value.object.get("retry_after") orelse return null;
+
+        const retry_after_secs: f64 = switch (retry_val) {
+            .integer => |secs| @floatFromInt(secs),
+            .float => |secs| secs,
+            else => return null,
+        };
+        if (!(retry_after_secs > 0)) return null;
+
+        const ns_per_s: f64 = @floatFromInt(std.time.ns_per_s);
+        const retry_after_ns = retry_after_secs * ns_per_s;
+        return @max(@as(u64, 1), @as(u64, @intFromFloat(@ceil(retry_after_ns))));
+    }
+
+    fn sendJsonRequestWithRateLimitRetry(
+        self: *DiscordChannel,
+        comptime method: enum { post, patch },
+        url: []const u8,
+        body: []const u8,
+        auth_header: []const u8,
+        action: []const u8,
+    ) !root.http_util.HttpResponse {
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            const resp = switch (method) {
+                .post => root.http_util.curlPostWithStatus(self.allocator, url, body, &.{auth_header}),
+                .patch => root.http_util.curlPatchWithStatus(self.allocator, url, body, &.{auth_header}),
+            } catch |err| {
+                log.err("Discord API {s} failed: {}", .{ action, err });
+                return error.DiscordApiError;
+            };
+
+            if (resp.status_code != 429) return resp;
+
+            const retry_after_ns = parseRetryAfterNs(self.allocator, resp.body) orelse std.time.ns_per_s;
+            const retry_after_ms: u64 = @intCast((retry_after_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms);
+            log.warn("Discord API {s} rate limited; retrying after {d} ms", .{ action, retry_after_ms });
+            self.allocator.free(resp.body);
+
+            if (attempt + 1 >= MAX_RATE_LIMIT_RETRIES) return error.DiscordApiError;
+            std.Thread.sleep(retry_after_ns);
+        }
+    }
+
     fn parseResponseMessageId(self: *DiscordChannel, response_body: []const u8) ![]u8 {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch {
             return error.DiscordApiError;
@@ -768,14 +801,7 @@ pub const DiscordChannel = struct {
         try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
         const auth_header = auth_fbs.getWritten();
 
-        self.rest_request_mu.lock();
-        defer self.rest_request_mu.unlock();
-        self.waitForRestRequestSlot();
-
-        const resp = root.http_util.curlPostWithStatus(self.allocator, url, body, &.{auth_header}) catch |err| {
-            log.err("Discord API POST failed: {}", .{err});
-            return error.DiscordApiError;
-        };
+        const resp = try self.sendJsonRequestWithRateLimitRetry(.post, url, body, auth_header, "create message");
         defer self.allocator.free(resp.body);
         try ensureSuccessfulApiResponse("create message", resp);
         return self.parseResponseMessageId(resp.body);
@@ -798,14 +824,7 @@ pub const DiscordChannel = struct {
         try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
         const auth_header = auth_fbs.getWritten();
 
-        self.rest_request_mu.lock();
-        defer self.rest_request_mu.unlock();
-        self.waitForRestRequestSlot();
-
-        const resp = root.http_util.curlPatchWithStatus(self.allocator, url, body, &.{auth_header}) catch |err| {
-            log.err("Discord API PATCH failed: {}", .{err});
-            return error.DiscordApiError;
-        };
+        const resp = try self.sendJsonRequestWithRateLimitRetry(.patch, url, body, auth_header, "edit message");
         defer self.allocator.free(resp.body);
         try ensureSuccessfulApiResponse("edit message", resp);
     }
@@ -1701,10 +1720,12 @@ test "discord edit url" {
     try std.testing.expectEqualStrings("https://discord.com/api/v10/channels/123456/messages/m-42", url);
 }
 
-test "discord nextRestRequestDelayNs enforces one request per second" {
-    try std.testing.expectEqual(@as(u64, 0), DiscordChannel.nextRestRequestDelayNs(0, 0));
-    try std.testing.expectEqual(@as(u64, 0), DiscordChannel.nextRestRequestDelayNs(1_000_000_000, 2_000_000_000));
-    try std.testing.expectEqual(@as(u64, 250_000_000), DiscordChannel.nextRestRequestDelayNs(1_000_000_000, 1_750_000_000));
+test "discord parseRetryAfterNs handles integer and float seconds" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectEqual(@as(?u64, 2 * std.time.ns_per_s), DiscordChannel.parseRetryAfterNs(alloc, "{\"retry_after\":2}"));
+    try std.testing.expectEqual(@as(?u64, 250_000_000), DiscordChannel.parseRetryAfterNs(alloc, "{\"retry_after\":0.25}"));
+    try std.testing.expectEqual(@as(?u64, null), DiscordChannel.parseRetryAfterNs(alloc, "{}"));
 }
 
 test "discord sendTypingIndicator is no-op in tests" {
