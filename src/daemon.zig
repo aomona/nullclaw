@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const health = @import("health.zig");
+const channels_root = @import("channels/root.zig");
 const Config = @import("config.zig").Config;
 const CronScheduler = @import("cron.zig").CronScheduler;
 const cron = @import("cron.zig");
@@ -667,6 +668,7 @@ const StreamingOutboundCtx = struct {
     channel: []const u8,
     account_id: ?[]const u8,
     chat_id: []const u8,
+    direct_channel: ?channels_root.Channel = null,
     pending_chunk: std.ArrayListUnmanaged(u8) = .empty,
     last_publish_ms: i64 = 0,
 
@@ -677,6 +679,13 @@ const StreamingOutboundCtx = struct {
 
 fn publishStreamingChunkMessage(ctx: *StreamingOutboundCtx, text: []const u8) void {
     if (text.len == 0) return;
+
+    if (ctx.direct_channel) |channel| {
+        channel.sendEvent(ctx.chat_id, text, &.{}, .chunk) catch |err| {
+            log.warn("inbound dispatch direct chunk send failed: {}", .{err});
+        };
+        return;
+    }
 
     const out = if (ctx.account_id) |aid|
         bus_mod.makeOutboundChunkWithAccount(ctx.allocator, ctx.channel, aid, ctx.chat_id, text)
@@ -781,12 +790,19 @@ fn inboundDispatcherThread(
         );
 
         const use_streaming_outbound = channelUsesStreamingOutbound(msg.channel);
+        const streaming_channel = if (std.mem.eql(u8, msg.channel, "discord")) blk: {
+            if (outbound_account_id) |aid| {
+                break :blk registry.findByNameAccount(msg.channel, aid);
+            }
+            break :blk registry.findByName(msg.channel);
+        } else null;
         var streaming_ctx = StreamingOutboundCtx{
             .allocator = allocator,
             .event_bus = event_bus,
             .channel = msg.channel,
             .account_id = outbound_account_id,
             .chat_id = outbound_chat_id,
+            .direct_channel = streaming_channel,
         };
         defer streaming_ctx.deinit();
         var stream_sink: ?streaming.Sink = null;
