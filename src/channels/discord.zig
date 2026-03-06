@@ -7,8 +7,8 @@ const websocket = @import("../websocket.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.discord);
-const DRAFT_FLUSH_MIN_DELTA_BYTES: usize = 64;
-const DRAFT_FLUSH_MIN_INTERVAL_MS: i64 = 200;
+const DRAFT_FLUSH_MIN_INTERVAL_MS: i64 = 1000;
+const REST_REQUEST_MIN_INTERVAL_NS: i128 = std.time.ns_per_s;
 
 /// Discord channel — connects via WebSocket gateway, sends via REST API.
 /// Splits messages at 2000 chars (Discord limit).
@@ -28,6 +28,8 @@ pub const DiscordChannel = struct {
 
     typing_mu: std.Thread.Mutex = .{},
     typing_handles: std.StringHashMapUnmanaged(*TypingTask) = .empty,
+    rest_request_mu: std.Thread.Mutex = .{},
+    last_rest_request_started_ns: i128 = 0,
     draft_mu: std.Thread.Mutex = .{},
     draft_states: std.StringHashMapUnmanaged(DraftState) = .empty,
     thread_parent_ids: std.StringHashMapUnmanaged([]u8) = .empty,
@@ -302,6 +304,20 @@ pub const DiscordChannel = struct {
     fn firstMessageChunk(text: []const u8) []const u8 {
         var it = root.splitMessage(text, MAX_MESSAGE_LEN);
         return it.next() orelse "";
+    }
+
+    fn nextRestRequestDelayNs(last_request_started_ns: i128, now_ns: i128) u64 {
+        if (last_request_started_ns <= 0) return 0;
+        const elapsed_ns = now_ns - last_request_started_ns;
+        if (elapsed_ns >= REST_REQUEST_MIN_INTERVAL_NS) return 0;
+        return @intCast(REST_REQUEST_MIN_INTERVAL_NS - @max(elapsed_ns, 0));
+    }
+
+    fn waitForRestRequestSlot(self: *DiscordChannel) void {
+        const now_ns = std.time.nanoTimestamp();
+        const delay_ns = nextRestRequestDelayNs(self.last_rest_request_started_ns, now_ns);
+        if (delay_ns > 0) std.Thread.sleep(delay_ns);
+        self.last_rest_request_started_ns = std.time.nanoTimestamp();
     }
 
     fn parseTarget(target: []const u8) !ParsedTarget {
@@ -752,6 +768,10 @@ pub const DiscordChannel = struct {
         try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
         const auth_header = auth_fbs.getWritten();
 
+        self.rest_request_mu.lock();
+        defer self.rest_request_mu.unlock();
+        self.waitForRestRequestSlot();
+
         const resp = root.http_util.curlPostWithStatus(self.allocator, url, body, &.{auth_header}) catch |err| {
             log.err("Discord API POST failed: {}", .{err});
             return error.DiscordApiError;
@@ -777,6 +797,10 @@ pub const DiscordChannel = struct {
         var auth_fbs = std.io.fixedBufferStream(&auth_buf);
         try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
         const auth_header = auth_fbs.getWritten();
+
+        self.rest_request_mu.lock();
+        defer self.rest_request_mu.unlock();
+        self.waitForRestRequestSlot();
 
         const resp = root.http_util.curlPatchWithStatus(self.allocator, url, body, &.{auth_header}) catch |err| {
             log.err("Discord API PATCH failed: {}", .{err});
@@ -826,15 +850,13 @@ pub const DiscordChannel = struct {
         const display_text = firstMessageChunk(state.buffer.items);
         if (display_text.len == 0) return;
 
-        const delta = display_text.len - state.last_flush_len;
         const now_ms = std.time.milliTimestamp();
         const elapsed_ms = now_ms - state.last_flush_time;
-        const buffer_overflowed = state.buffer.items.len > MAX_MESSAGE_LEN;
 
         const should_flush = if (state.draft_message_id == null)
             true
         else
-            delta > 0 and (buffer_overflowed or delta >= DRAFT_FLUSH_MIN_DELTA_BYTES or elapsed_ms >= DRAFT_FLUSH_MIN_INTERVAL_MS);
+            display_text.len > state.last_flush_len and elapsed_ms >= DRAFT_FLUSH_MIN_INTERVAL_MS;
         if (!should_flush) return;
 
         try self.flushDraftChunk(target, state);
@@ -1677,6 +1699,12 @@ test "discord edit url" {
     var buf: [320]u8 = undefined;
     const url = try DiscordChannel.editUrl(&buf, "123456", "m-42");
     try std.testing.expectEqualStrings("https://discord.com/api/v10/channels/123456/messages/m-42", url);
+}
+
+test "discord nextRestRequestDelayNs enforces one request per second" {
+    try std.testing.expectEqual(@as(u64, 0), DiscordChannel.nextRestRequestDelayNs(0, 0));
+    try std.testing.expectEqual(@as(u64, 0), DiscordChannel.nextRestRequestDelayNs(1_000_000_000, 2_000_000_000));
+    try std.testing.expectEqual(@as(u64, 250_000_000), DiscordChannel.nextRestRequestDelayNs(1_000_000_000, 1_750_000_000));
 }
 
 test "discord sendTypingIndicator is no-op in tests" {
