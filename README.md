@@ -435,6 +435,8 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 }
 ```
 
+When `channels.discord.accounts.<name>.guild_id` is set, nullclaw only processes guild events and messages from that server while still accepting Discord DMs for the same bot account.
+
 ### Full Web Search + Shell Access
 
 Use this when you want full web-search provider control plus unrestricted shell command allowlist behavior:

@@ -1054,8 +1054,17 @@ pub const DiscordChannel = struct {
         };
     }
 
+    fn matchesConfiguredGuild(self: *const DiscordChannel, guild_id: ?[]const u8, allow_missing: bool) bool {
+        const configured_guild_id = self.guild_id orelse return true;
+        if (guild_id) |gid| {
+            return std.mem.eql(u8, gid, configured_guild_id);
+        }
+        return allow_missing;
+    }
+
     fn handleGuildCreate(self: *DiscordChannel, root_val: std.json.Value) !void {
         const d_obj = dispatchPayloadObject(root_val, "GUILD_CREATE") orelse return;
+        if (!self.matchesConfiguredGuild(jsonString(d_obj, "guild_id"), false)) return;
         if (d_obj.get("channels")) |channels_val| {
             self.cacheChannelsFromArray(channels_val);
         }
@@ -1066,11 +1075,13 @@ pub const DiscordChannel = struct {
 
     fn handleChannelUpsert(self: *DiscordChannel, root_val: std.json.Value) !void {
         const d_obj = dispatchPayloadObject(root_val, "CHANNEL_UPSERT") orelse return;
+        if (!self.matchesConfiguredGuild(jsonString(d_obj, "guild_id"), false)) return;
         try self.cacheChannelObject(d_obj);
     }
 
     fn handleChannelDelete(self: *DiscordChannel, root_val: std.json.Value) !void {
         const d_obj = dispatchPayloadObject(root_val, "CHANNEL_DELETE") orelse return;
+        if (!self.matchesConfiguredGuild(jsonString(d_obj, "guild_id"), false)) return;
         const channel_id = jsonString(d_obj, "id") orelse return;
         const channel_type = jsonInt(d_obj, "type") orelse return;
 
@@ -1084,12 +1095,14 @@ pub const DiscordChannel = struct {
 
     fn handleThreadDelete(self: *DiscordChannel, root_val: std.json.Value) !void {
         const d_obj = dispatchPayloadObject(root_val, "THREAD_DELETE") orelse return;
+        if (!self.matchesConfiguredGuild(jsonString(d_obj, "guild_id"), false)) return;
         const thread_id = jsonString(d_obj, "id") orelse return;
         self.removeThreadParent(thread_id);
     }
 
     fn handleThreadListSync(self: *DiscordChannel, root_val: std.json.Value) !void {
         const d_obj = dispatchPayloadObject(root_val, "THREAD_LIST_SYNC") orelse return;
+        if (!self.matchesConfiguredGuild(jsonString(d_obj, "guild_id"), false)) return;
         if (d_obj.get("threads")) |threads_val| {
             self.cacheChannelsFromArray(threads_val);
         }
@@ -1128,6 +1141,8 @@ pub const DiscordChannel = struct {
             .string => |s| s,
             else => null,
         } else null;
+
+        if (!self.matchesConfiguredGuild(guild_id, true)) return;
 
         // Extract author object
         const author_obj = if (d_obj.get("author")) |v| switch (v) {
@@ -1654,6 +1669,75 @@ test "discord handleMessageCreate sets is_dm metadata for direct messages" {
     try std.testing.expect(meta.value.object.get("is_dm") != null);
     try std.testing.expect(meta.value.object.get("is_dm").?.bool);
     try std.testing.expect(meta.value.object.get("guild_id") == null);
+}
+
+test "discord handleMessageCreate ignores guild messages outside configured guild" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .guild_id = "guild-1",
+    });
+    ch.setBus(&event_bus);
+
+    const msg_json =
+        \\{"d":{"id":"m-1","channel_id":"c-1","guild_id":"guild-2","content":"hello","author":{"id":"u-1","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
+}
+
+test "discord handleMessageCreate allows direct messages when guild scoped" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .guild_id = "guild-1",
+    });
+    ch.setBus(&event_bus);
+
+    const msg_json =
+        \\{"d":{"channel_id":"dm-7","content":"hi dm","author":{"id":"u-7","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+
+    var msg = event_bus.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("discord:dc-main:direct:u-7", msg.session_key);
+}
+
+test "discord handleGuildCreate ignores caches outside configured guild" {
+    const alloc = std.testing.allocator;
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .guild_id = "guild-1",
+    });
+    defer ch.clearThreadCaches();
+
+    const guild_json =
+        \\{"d":{"guild_id":"guild-2","channels":[{"id":"forum-1","guild_id":"guild-2","type":15}],"threads":[{"id":"thread-1","guild_id":"guild-2","parent_id":"forum-1","type":11}]}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, guild_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleGuildCreate(parsed.value);
+
+    try std.testing.expect(ch.forum_parent_ids.get("forum-1") == null);
+    try std.testing.expect(ch.thread_parent_ids.get("thread-1") == null);
 }
 
 test "discord handleMessageCreate require_mention blocks unmentioned guild messages" {
