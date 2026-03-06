@@ -810,7 +810,7 @@ fn inboundDispatcherThread(
             null,
             stream_sink,
         ) catch |err| {
-            log.warn("inbound dispatch process failed: {}", .{err});
+            log.warn("inbound dispatch process failed: provider={s} error={}", .{ runtime.session_mgr.provider.getName(), err });
 
             // Send user-visible error reply back to the originating channel
             const err_msg: []const u8 = switch (err) {
