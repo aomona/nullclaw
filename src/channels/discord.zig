@@ -1740,19 +1740,21 @@ pub const DiscordChannel = struct {
             break :blk std.mem.eql(u8, author, bot_uid);
         };
 
-        if (message_id) |mid| {
-            if (reply_thread_root_id) |root_id| {
-                self.upsertReplyThreadRoot(mid, root_id) catch |err| {
-                    log.warn("Discord: failed to cache reply context: {}", .{err});
-                };
-            }
-        }
+        const is_own_bot_message = blk: {
+            const bot_uid = self.bot_user_id orelse break :blk false;
+            break :blk std.mem.eql(u8, author_id, bot_uid);
+        };
 
         // Never process messages sent by this bot account.
-        if (self.bot_user_id) |bot_uid| {
-            if (std.mem.eql(u8, author_id, bot_uid)) {
-                return;
+        if (is_own_bot_message) {
+            if (message_id) |mid| {
+                if (reply_thread_root_id) |root_id| {
+                    self.upsertReplyThreadRoot(mid, root_id) catch |err| {
+                        log.warn("Discord: failed to cache reply context: {}", .{err});
+                    };
+                }
             }
+            return;
         }
 
         // Filter 1: bot author
@@ -1778,6 +1780,16 @@ pub const DiscordChannel = struct {
         if (self.allow_from.len > 0) {
             if (!root.isAllowed(self.allow_from, author_id)) {
                 return;
+            }
+        }
+
+        if (message_id) |mid| {
+            if (reply_thread_root_id) |root_id| {
+                if (reply_targets_bot or reply_from_known_chain) {
+                    self.upsertReplyThreadRoot(mid, root_id) catch |err| {
+                        log.warn("Discord: failed to cache reply context: {}", .{err});
+                    };
+                }
             }
         }
 
@@ -2602,6 +2614,42 @@ test "discord handleMessageCreate reply chain bypasses mention and carries threa
     const meta_2 = try std.json.parseFromSlice(std.json.Value, alloc, msg_2.metadata_json.?, .{});
     defer meta_2.deinit();
     try std.testing.expectEqualStrings("m-root", meta_2.value.object.get("thread_id").?.string);
+}
+
+test "discord handleMessageCreate ignores non-bot reply chains without mention" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .require_mention = true,
+    });
+    defer ch.clearThreadCaches();
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-1");
+    defer alloc.free(ch.bot_user_id.?);
+
+    const user_reply_1_json =
+        \\{"d":{"id":"u-1","channel_id":"c-2","guild_id":"g-2","content":"first human reply","author":{"id":"u-2","bot":false},"message_reference":{"message_id":"m-root"},"referenced_message":{"id":"m-root","author":{"id":"u-9","bot":false}}}}
+    ;
+    const user_reply_1 = try std.json.parseFromSlice(std.json.Value, alloc, user_reply_1_json, .{});
+    defer user_reply_1.deinit();
+    try ch.handleMessageCreate(user_reply_1.value);
+
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
+    try std.testing.expectEqual(@as(usize, 0), ch.reply_thread_roots.count());
+
+    const user_reply_2_json =
+        \\{"d":{"id":"u-2","channel_id":"c-2","guild_id":"g-2","content":"second human reply","author":{"id":"u-3","bot":false},"message_reference":{"message_id":"u-1"},"referenced_message":{"id":"u-1","author":{"id":"u-2","bot":false}}}}
+    ;
+    const user_reply_2 = try std.json.parseFromSlice(std.json.Value, alloc, user_reply_2_json, .{});
+    defer user_reply_2.deinit();
+    try ch.handleMessageCreate(user_reply_2.value);
+
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
+    try std.testing.expectEqual(@as(usize, 0), ch.reply_thread_roots.count());
 }
 
 test "discord handleMessageCreate forum thread requires mention unless parent exempt" {
