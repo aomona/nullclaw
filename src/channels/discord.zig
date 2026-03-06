@@ -1349,7 +1349,7 @@ pub const DiscordChannel = struct {
 
     fn handleGuildCreate(self: *DiscordChannel, root_val: std.json.Value) !void {
         const d_obj = dispatchPayloadObject(root_val, "GUILD_CREATE") orelse return;
-        if (!self.matchesConfiguredGuild(jsonString(d_obj, "guild_id"), false)) return;
+        if (!self.matchesConfiguredGuild(jsonString(d_obj, "id"), false)) return;
         if (d_obj.get("channels")) |channels_val| {
             self.cacheChannelsFromArray(channels_val);
         }
@@ -2088,7 +2088,7 @@ test "discord handleGuildCreate ignores caches outside configured guild" {
     defer ch.clearThreadCaches();
 
     const guild_json =
-        \\{"d":{"guild_id":"guild-2","channels":[{"id":"forum-1","guild_id":"guild-2","type":15}],"threads":[{"id":"thread-1","guild_id":"guild-2","parent_id":"forum-1","type":11}]}}
+        \\{"d":{"id":"guild-2","channels":[{"id":"forum-1","guild_id":"guild-2","type":15}],"threads":[{"id":"thread-1","guild_id":"guild-2","parent_id":"forum-1","type":11}]}}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, guild_json, .{});
     defer parsed.deinit();
@@ -2097,6 +2097,28 @@ test "discord handleGuildCreate ignores caches outside configured guild" {
 
     try std.testing.expect(ch.forum_parent_ids.get("forum-1") == null);
     try std.testing.expect(ch.thread_parent_ids.get("thread-1") == null);
+}
+
+test "discord handleGuildCreate caches configured guild snapshot by id" {
+    const alloc = std.testing.allocator;
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .guild_id = "guild-1",
+    });
+    defer ch.clearThreadCaches();
+
+    const guild_json =
+        \\{"d":{"id":"guild-1","channels":[{"id":"forum-1","guild_id":"guild-1","type":15}],"threads":[{"id":"thread-1","guild_id":"guild-1","parent_id":"forum-1","type":11}]}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, guild_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleGuildCreate(parsed.value);
+
+    try std.testing.expect(ch.forum_parent_ids.get("forum-1") != null);
+    try std.testing.expectEqualStrings("forum-1", ch.thread_parent_ids.get("thread-1").?);
 }
 
 test "discord handleMessageCreate require_mention blocks unmentioned guild messages" {
