@@ -219,6 +219,32 @@ pub const Agent = struct {
         success: bool,
     };
 
+    const StreamingRelayCtx = struct {
+        allocator: std.mem.Allocator,
+        downstream_callback: providers.StreamCallback,
+        downstream_ctx: *anyopaque,
+        raw_text: std.ArrayListUnmanaged(u8) = .empty,
+        append_failed: bool = false,
+        saw_chunk: bool = false,
+
+        fn deinit(self: *StreamingRelayCtx) void {
+            self.raw_text.deinit(self.allocator);
+        }
+
+        fn callback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *StreamingRelayCtx = @ptrCast(@alignCast(ctx_ptr));
+            if (!chunk.is_final and chunk.delta.len > 0) {
+                self.saw_chunk = true;
+                if (!self.append_failed) {
+                    self.raw_text.appendSlice(self.allocator, chunk.delta) catch {
+                        self.append_failed = true;
+                    };
+                }
+            }
+            self.downstream_callback(self.downstream_ctx, chunk);
+        }
+    };
+
     pub const UsageRecordCallback = *const fn (ctx: *anyopaque, record: UsageRecord) void;
 
     allocator: std.mem.Allocator,
@@ -1023,22 +1049,30 @@ pub const Agent = struct {
             var response_attempt: u32 = 1;
             if (is_streaming) {
                 self.logLlmRequest(iteration + 1, 1, messages, native_tools_enabled, true);
-                const stream_result = self.provider.streamChat(
+                const stream_request = providers.ChatRequest{
+                    .messages = messages,
+                    .model = self.model_name,
+                    .temperature = self.temperature,
+                    .max_tokens = request_max_tokens,
+                    .tools = null,
+                    .timeout_secs = self.message_timeout_secs,
+                    .reasoning_effort = self.reasoning_effort,
+                };
+                var relay_ctx = StreamingRelayCtx{
+                    .allocator = self.allocator,
+                    .downstream_callback = self.stream_callback.?,
+                    .downstream_ctx = self.stream_ctx.?,
+                };
+                defer relay_ctx.deinit();
+
+                const stream_result: ?providers.StreamChatResult = self.provider.streamChat(
                     self.allocator,
-                    .{
-                        .messages = messages,
-                        .model = self.model_name,
-                        .temperature = self.temperature,
-                        .max_tokens = request_max_tokens,
-                        .tools = null,
-                        .timeout_secs = self.message_timeout_secs,
-                        .reasoning_effort = self.reasoning_effort,
-                    },
+                    stream_request,
                     self.model_name,
                     self.temperature,
-                    self.stream_callback.?,
-                    self.stream_ctx.?,
-                ) catch |err| {
+                    StreamingRelayCtx.callback,
+                    @ptrCast(&relay_ctx),
+                ) catch |err| blk: {
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
                     const fail_event = ObserverEvent{ .llm_response = .{
                         .provider = self.provider.getName(),
@@ -1048,15 +1082,60 @@ pub const Agent = struct {
                         .error_message = @errorName(err),
                     } };
                     self.observer.recordEvent(&fail_event);
+
+                    if (!relay_ctx.append_failed and relay_ctx.raw_text.items.len > 0) {
+                        log.warn(
+                            "streaming provider {s} failed after partial output; returning partial response: {}",
+                            .{ self.provider.getName(), err },
+                        );
+                        response = try self.makePartialStreamingResponse(&relay_ctx);
+                        break :blk null;
+                    }
+
+                    if (!relay_ctx.saw_chunk and isNetworkCurlError(err)) {
+                        const fallback_native_tools_enabled = self.provider.supportsNativeTools();
+                        response_attempt = 2;
+                        self.logLlmRequest(iteration + 1, 2, messages, fallback_native_tools_enabled, false);
+                        response = self.provider.chat(
+                            self.allocator,
+                            .{
+                                .messages = messages,
+                                .model = self.model_name,
+                                .temperature = self.temperature,
+                                .max_tokens = request_max_tokens,
+                                .tools = if (fallback_native_tools_enabled) turn_tool_specs else null,
+                                .timeout_secs = self.message_timeout_secs,
+                                .reasoning_effort = self.reasoning_effort,
+                            },
+                            self.model_name,
+                            self.temperature,
+                        ) catch |fallback_err| {
+                            const fallback_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
+                            const fallback_event = ObserverEvent{ .llm_response = .{
+                                .provider = self.provider.getName(),
+                                .model = self.model_name,
+                                .duration_ms = fallback_duration,
+                                .success = false,
+                                .error_message = @errorName(fallback_err),
+                            } };
+                            self.observer.recordEvent(&fallback_event);
+                            self.emitUsageFailure();
+                            return fallback_err;
+                        };
+                        break :blk null;
+                    }
+
                     self.emitUsageFailure();
                     return err;
                 };
-                response = ChatResponse{
-                    .content = stream_result.content,
-                    .tool_calls = &.{},
-                    .usage = stream_result.usage,
-                    .model = stream_result.model,
-                };
+                if (stream_result) |result| {
+                    response = ChatResponse{
+                        .content = result.content,
+                        .tool_calls = &.{},
+                        .usage = result.usage,
+                        .model = result.model,
+                    };
+                }
             } else {
                 self.logLlmRequest(iteration + 1, 1, messages, native_tools_enabled, false);
                 response = self.provider.chat(
@@ -1697,6 +1776,34 @@ pub const Agent = struct {
             return .{ .slice = text, .truncated = false };
         }
         return .{ .slice = text[0..LLM_LOG_MAX_BYTES], .truncated = true };
+    }
+
+    fn isNetworkCurlError(err: anyerror) bool {
+        return err == error.CurlFailed or
+            err == error.CurlReadError or
+            err == error.CurlWaitError or
+            err == error.CurlWriteError;
+    }
+
+    fn makePartialStreamingResponse(self: *Agent, relay: *const StreamingRelayCtx) !ChatResponse {
+        const response_content = if (relay.raw_text.items.len > 0)
+            try self.allocator.dupe(u8, relay.raw_text.items)
+        else
+            null;
+
+        var usage: providers.TokenUsage = .{};
+        if (relay.raw_text.items.len > 0) {
+            usage.completion_tokens = @intCast((relay.raw_text.items.len + 3) / 4);
+            usage.total_tokens = usage.completion_tokens;
+        }
+
+        return .{
+            .content = response_content,
+            .tool_calls = &.{},
+            .usage = usage,
+            .provider = "",
+            .model = "",
+        };
     }
 
     fn logLlmRequest(self: *Agent, iteration: u32, attempt: u32, messages: []const ChatMessage, native_tools_enabled: bool, is_streaming: bool) void {
@@ -4768,6 +4875,207 @@ test "Agent falls back to blocking chat when stream ctx is missing" {
     try std.testing.expectEqualStrings("ok", response);
     try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
     try std.testing.expectEqual(@as(usize, 0), provider_state.stream_calls);
+}
+
+test "Agent falls back to blocking chat when streaming fails before chunks" {
+    const allocator = std.testing.allocator;
+
+    const FallbackProvider = struct {
+        stream_calls: usize = 0,
+        chat_calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "fallback ok");
+        }
+
+        fn chat(ptr: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.chat_calls += 1;
+            return .{
+                .content = try allocator_.dupe(u8, "fallback ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            _: providers.StreamCallback,
+            _: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.stream_calls += 1;
+            return error.CurlFailed;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "fallback-stream";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var provider_state = FallbackProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = FallbackProvider.chatWithSystem,
+        .chat = FallbackProvider.chat,
+        .supportsNativeTools = FallbackProvider.supportsNativeTools,
+        .getName = FallbackProvider.getName,
+        .deinit = FallbackProvider.deinitFn,
+        .supports_streaming = FallbackProvider.supportsStreaming,
+        .stream_chat = FallbackProvider.streamChat,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const test_cb: providers.StreamCallback = struct {
+        fn cb(_: *anyopaque, _: providers.StreamChunk) void {}
+    }.cb;
+    var stream_ctx: u8 = 0;
+    agent.stream_callback = test_cb;
+    agent.stream_ctx = @ptrCast(&stream_ctx);
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("fallback ok", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.stream_calls);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+}
+
+test "Agent returns partial streamed text when provider fails after chunks" {
+    const allocator = std.testing.allocator;
+
+    const PartialProvider = struct {
+        stream_calls: usize = 0,
+        chat_calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "unused");
+        }
+
+        fn chat(ptr: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.chat_calls += 1;
+            return .{
+                .content = try allocator_.dupe(u8, "unused"),
+                .tool_calls = &.{},
+                .usage = .{},
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.stream_calls += 1;
+            callback(callback_ctx, providers.StreamChunk.textDelta("partial"));
+            return error.CurlFailed;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "partial-stream";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var provider_state = PartialProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = PartialProvider.chatWithSystem,
+        .chat = PartialProvider.chat,
+        .supportsNativeTools = PartialProvider.supportsNativeTools,
+        .getName = PartialProvider.getName,
+        .deinit = PartialProvider.deinitFn,
+        .supports_streaming = PartialProvider.supportsStreaming,
+        .stream_chat = PartialProvider.streamChat,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const test_cb: providers.StreamCallback = struct {
+        fn cb(_: *anyopaque, _: providers.StreamChunk) void {}
+    }.cb;
+    var stream_ctx: u8 = 0;
+    agent.stream_callback = test_cb;
+    agent.stream_ctx = @ptrCast(&stream_ctx);
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("partial", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.stream_calls);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.chat_calls);
 }
 
 test "Agent shouldForceActionFollowThrough detects english deferred promise" {
