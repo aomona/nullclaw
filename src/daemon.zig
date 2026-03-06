@@ -25,6 +25,8 @@ const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
 
 const log = std.log.scoped(.daemon);
+const DISCORD_STREAM_CHUNK_MIN_DELTA_BYTES: usize = 64;
+const DISCORD_STREAM_CHUNK_MIN_INTERVAL_MS: i64 = 250;
 
 /// How often the daemon state file is flushed (seconds).
 const STATUS_FLUSH_SECONDS: u64 = 5;
@@ -665,16 +667,21 @@ const StreamingOutboundCtx = struct {
     channel: []const u8,
     account_id: ?[]const u8,
     chat_id: []const u8,
+    pending_chunk: std.ArrayListUnmanaged(u8) = .empty,
+    last_publish_ms: i64 = 0,
+
+    fn deinit(self: *StreamingOutboundCtx) void {
+        self.pending_chunk.deinit(self.allocator);
+    }
 };
 
-fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
-    if (event.stage != .chunk or event.text.len == 0) return;
-    const ctx: *StreamingOutboundCtx = @ptrCast(@alignCast(ctx_ptr));
+fn publishStreamingChunkMessage(ctx: *StreamingOutboundCtx, text: []const u8) void {
+    if (text.len == 0) return;
 
     const out = if (ctx.account_id) |aid|
-        bus_mod.makeOutboundChunkWithAccount(ctx.allocator, ctx.channel, aid, ctx.chat_id, event.text)
+        bus_mod.makeOutboundChunkWithAccount(ctx.allocator, ctx.channel, aid, ctx.chat_id, text)
     else
-        bus_mod.makeOutboundChunk(ctx.allocator, ctx.channel, ctx.chat_id, event.text);
+        bus_mod.makeOutboundChunk(ctx.allocator, ctx.channel, ctx.chat_id, text);
 
     var message = out catch |err| {
         log.warn("inbound dispatch chunk makeOutbound failed: {}", .{err});
@@ -686,6 +693,43 @@ fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
             log.warn("inbound dispatch chunk publishOutbound failed: {}", .{err});
         }
     };
+}
+
+fn flushPendingDiscordChunk(ctx: *StreamingOutboundCtx) void {
+    if (ctx.pending_chunk.items.len == 0) return;
+    publishStreamingChunkMessage(ctx, ctx.pending_chunk.items);
+    ctx.pending_chunk.clearRetainingCapacity();
+    ctx.last_publish_ms = std.time.milliTimestamp();
+}
+
+fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
+    const ctx: *StreamingOutboundCtx = @ptrCast(@alignCast(ctx_ptr));
+
+    if (std.mem.eql(u8, ctx.channel, "discord")) {
+        switch (event.stage) {
+            .chunk => {
+                if (event.text.len == 0) return;
+                ctx.pending_chunk.appendSlice(ctx.allocator, event.text) catch |err| {
+                    log.warn("inbound dispatch chunk buffer append failed: {}", .{err});
+                    return;
+                };
+
+                const now_ms = std.time.milliTimestamp();
+                const elapsed_ms = now_ms - ctx.last_publish_ms;
+                const should_flush = if (ctx.last_publish_ms == 0)
+                    true
+                else
+                    ctx.pending_chunk.items.len >= DISCORD_STREAM_CHUNK_MIN_DELTA_BYTES or
+                        elapsed_ms >= DISCORD_STREAM_CHUNK_MIN_INTERVAL_MS;
+                if (should_flush) flushPendingDiscordChunk(ctx);
+            },
+            .final => flushPendingDiscordChunk(ctx),
+        }
+        return;
+    }
+
+    if (event.stage != .chunk or event.text.len == 0) return;
+    publishStreamingChunkMessage(ctx, event.text);
 }
 
 fn inboundDispatcherThread(
@@ -744,6 +788,7 @@ fn inboundDispatcherThread(
             .account_id = outbound_account_id,
             .chat_id = outbound_chat_id,
         };
+        defer streaming_ctx.deinit();
         var stream_sink: ?streaming.Sink = null;
         var outbound_tag_filter: streaming.TagFilter = undefined;
         if (use_streaming_outbound) {
@@ -1795,6 +1840,7 @@ test "publishStreamingChunk preserves discord reply target" {
         .account_id = "dc-main",
         .chat_id = "channel:1234567890:reply:9988776655",
     };
+    defer ctx.deinit();
 
     publishStreamingChunk(@ptrCast(&ctx), .{ .stage = .chunk, .text = "hello" });
 
@@ -1803,6 +1849,37 @@ test "publishStreamingChunk preserves discord reply target" {
     try std.testing.expectEqualStrings("channel:1234567890:reply:9988776655", msg.chat_id);
     try std.testing.expectEqualStrings("dc-main", msg.account_id.?);
     try std.testing.expect(msg.stage == .chunk);
+}
+
+test "publishStreamingChunk coalesces discord chunks until final" {
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ctx = StreamingOutboundCtx{
+        .allocator = std.testing.allocator,
+        .event_bus = &event_bus,
+        .channel = "discord",
+        .account_id = null,
+        .chat_id = "channel:1234567890:reply:9988776655",
+    };
+    defer ctx.deinit();
+
+    publishStreamingChunk(@ptrCast(&ctx), .{ .stage = .chunk, .text = "Hello" });
+    try std.testing.expectEqual(@as(usize, 1), event_bus.outboundDepth());
+
+    publishStreamingChunk(@ptrCast(&ctx), .{ .stage = .chunk, .text = " there" });
+    try std.testing.expectEqual(@as(usize, 1), event_bus.outboundDepth());
+
+    publishStreamingChunk(@ptrCast(&ctx), .{ .stage = .final });
+    try std.testing.expectEqual(@as(usize, 2), event_bus.outboundDepth());
+
+    var first = event_bus.consumeOutbound() orelse return error.TestUnexpectedResult;
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Hello", first.content);
+
+    var second = event_bus.consumeOutbound() orelse return error.TestUnexpectedResult;
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(" there", second.content);
 }
 
 test "hasSupervisedChannels true for nostr" {
