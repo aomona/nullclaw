@@ -610,6 +610,16 @@ fn resolveTypingRecipient(
     return allocator.dupe(u8, chat_id) catch null;
 }
 
+fn channelUsesStreamingOutbound(channel_name: []const u8) bool {
+    return std.mem.eql(u8, channel_name, "web") or
+        std.mem.eql(u8, channel_name, "telegram") or
+        std.mem.eql(u8, channel_name, "discord");
+}
+
+fn channelUsesTagFilteredStreaming(channel_name: []const u8) bool {
+    return std.mem.eql(u8, channel_name, "telegram") or std.mem.eql(u8, channel_name, "discord");
+}
+
 fn sendInboundProcessingIndicator(
     allocator: std.mem.Allocator,
     registry: *const dispatch.ChannelRegistry,
@@ -726,7 +736,7 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const use_streaming_outbound = std.mem.eql(u8, msg.channel, "web") or std.mem.eql(u8, msg.channel, "telegram");
+        const use_streaming_outbound = channelUsesStreamingOutbound(msg.channel);
         var streaming_ctx = StreamingOutboundCtx{
             .allocator = allocator,
             .event_bus = event_bus,
@@ -741,7 +751,7 @@ fn inboundDispatcherThread(
                 .callback = publishStreamingChunk,
                 .ctx = @ptrCast(&streaming_ctx),
             };
-            if (std.mem.eql(u8, msg.channel, "telegram")) {
+            if (channelUsesTagFilteredStreaming(msg.channel)) {
                 outbound_tag_filter = streaming.TagFilter.init(raw_sink);
                 stream_sink = outbound_tag_filter.sink();
             } else {
@@ -1759,6 +1769,19 @@ test "resolveDiscordReplyTarget builds reply target from message id" {
 test "resolveDiscordReplyTarget returns null when message id missing" {
     const target = resolveDiscordReplyTarget(std.testing.allocator, "1234567890", .{});
     try std.testing.expect(target == null);
+}
+
+test "channelUsesStreamingOutbound includes discord" {
+    try std.testing.expect(channelUsesStreamingOutbound("web"));
+    try std.testing.expect(channelUsesStreamingOutbound("telegram"));
+    try std.testing.expect(channelUsesStreamingOutbound("discord"));
+    try std.testing.expect(!channelUsesStreamingOutbound("slack"));
+}
+
+test "channelUsesTagFilteredStreaming includes discord and telegram only" {
+    try std.testing.expect(channelUsesTagFilteredStreaming("telegram"));
+    try std.testing.expect(channelUsesTagFilteredStreaming("discord"));
+    try std.testing.expect(!channelUsesTagFilteredStreaming("web"));
 }
 
 test "hasSupervisedChannels true for nostr" {

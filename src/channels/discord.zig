@@ -7,6 +7,8 @@ const websocket = @import("../websocket.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.discord);
+const DRAFT_FLUSH_MIN_DELTA_BYTES: usize = 64;
+const DRAFT_FLUSH_MIN_INTERVAL_MS: i64 = 200;
 
 /// Discord channel — connects via WebSocket gateway, sends via REST API.
 /// Splits messages at 2000 chars (Discord limit).
@@ -26,9 +28,12 @@ pub const DiscordChannel = struct {
 
     typing_mu: std.Thread.Mutex = .{},
     typing_handles: std.StringHashMapUnmanaged(*TypingTask) = .empty,
+    draft_mu: std.Thread.Mutex = .{},
+    draft_states: std.StringHashMapUnmanaged(DraftState) = .empty,
     thread_parent_ids: std.StringHashMapUnmanaged([]u8) = .empty,
     forum_parent_ids: std.StringHashMapUnmanaged(void) = .empty,
     reply_thread_roots: std.StringHashMapUnmanaged([]u8) = .empty,
+    test_transport: TestTransportField = .{},
 
     // Gateway state
     running: Atomic(bool) = Atomic(bool).init(false),
@@ -74,6 +79,52 @@ pub const DiscordChannel = struct {
         stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         thread: ?std.Thread = null,
     };
+
+    const DraftState = struct {
+        draft_message_id: ?[]u8 = null,
+        buffer: std.ArrayListUnmanaged(u8) = .empty,
+        last_flush_len: usize = 0,
+        last_flush_time: i64 = 0,
+        overflowed: bool = false,
+
+        fn deinit(self: *DraftState, allocator: std.mem.Allocator) void {
+            if (self.draft_message_id) |message_id| allocator.free(message_id);
+            self.buffer.deinit(allocator);
+        }
+    };
+
+    const TestRequestKind = enum {
+        create,
+        edit,
+    };
+
+    const TestRequest = struct {
+        kind: TestRequestKind,
+        channel_id: []u8,
+        content: []u8,
+        message_id: ?[]u8 = null,
+        reply_message_id: ?[]u8 = null,
+
+        fn deinit(self: *const TestRequest, allocator: std.mem.Allocator) void {
+            allocator.free(self.channel_id);
+            allocator.free(self.content);
+            if (self.message_id) |message_id| allocator.free(message_id);
+            if (self.reply_message_id) |reply_message_id| allocator.free(reply_message_id);
+        }
+    };
+
+    const TestTransport = struct {
+        next_message_id: usize = 1,
+        requests: std.ArrayListUnmanaged(TestRequest) = .empty,
+
+        fn deinit(self: *TestTransport, allocator: std.mem.Allocator) void {
+            for (self.requests.items) |req| req.deinit(allocator);
+            self.requests.deinit(allocator);
+            self.* = .{};
+        }
+    };
+
+    const TestTransportField = if (builtin.is_test) TestTransport else struct {};
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -121,6 +172,14 @@ pub const DiscordChannel = struct {
         var fbs = std.io.fixedBufferStream(buf);
         const w = fbs.writer();
         try w.print("https://discord.com/api/v10/channels/{s}/typing", .{channel_id});
+        return fbs.getWritten();
+    }
+
+    /// Build a Discord REST API URL for editing a message.
+    pub fn editUrl(buf: []u8, channel_id: []const u8, message_id: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        try w.print("https://discord.com/api/v10/channels/{s}/messages/{s}", .{ channel_id, message_id });
         return fbs.getWritten();
     }
 
@@ -238,6 +297,11 @@ pub const DiscordChannel = struct {
         if (s.len < prefix.len) return null;
         if (!std.ascii.eqlIgnoreCase(s[0..prefix.len], prefix)) return null;
         return s[prefix.len..];
+    }
+
+    fn firstMessageChunk(text: []const u8) []const u8 {
+        var it = root.splitMessage(text, MAX_MESSAGE_LEN);
+        return it.next() orelse "";
     }
 
     fn parseTarget(target: []const u8) !ParsedTarget {
@@ -462,6 +526,82 @@ pub const DiscordChannel = struct {
         self.reply_thread_roots = .empty;
     }
 
+    fn deinitDraftStates(self: *DiscordChannel) void {
+        self.draft_mu.lock();
+        var drafts = self.draft_states;
+        self.draft_states = .empty;
+        self.draft_mu.unlock();
+
+        var it = drafts.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(@constCast(entry.key_ptr.*));
+            entry.value_ptr.deinit(self.allocator);
+        }
+        drafts.deinit(self.allocator);
+    }
+
+    fn deinitTestTransport(self: *DiscordChannel) void {
+        if (builtin.is_test) {
+            self.test_transport.deinit(self.allocator);
+        }
+    }
+
+    fn recordTestRequest(
+        self: *DiscordChannel,
+        kind: TestRequestKind,
+        channel_id: []const u8,
+        message_id: ?[]const u8,
+        reply_message_id: ?[]const u8,
+        content: []const u8,
+    ) !?[]u8 {
+        if (builtin.is_test) {
+            const channel_id_copy = try self.allocator.dupe(u8, channel_id);
+            errdefer self.allocator.free(channel_id_copy);
+            const content_copy = try self.allocator.dupe(u8, content);
+            errdefer self.allocator.free(content_copy);
+            const message_id_copy = if (message_id) |mid| try self.allocator.dupe(u8, mid) else null;
+            errdefer if (message_id_copy) |mid| self.allocator.free(mid);
+            const reply_message_id_copy = if (reply_message_id) |mid| try self.allocator.dupe(u8, mid) else null;
+            errdefer if (reply_message_id_copy) |mid| self.allocator.free(mid);
+
+            try self.test_transport.requests.append(self.allocator, .{
+                .kind = kind,
+                .channel_id = channel_id_copy,
+                .content = content_copy,
+                .message_id = message_id_copy,
+                .reply_message_id = reply_message_id_copy,
+            });
+
+            if (kind != .create) return null;
+
+            const created_message_id = try std.fmt.allocPrint(self.allocator, "draft-{d}", .{self.test_transport.next_message_id});
+            self.test_transport.next_message_id += 1;
+            return created_message_id;
+        }
+
+        return null;
+    }
+
+    fn ensureSuccessfulApiResponse(action: []const u8, response: root.http_util.HttpResponse) !void {
+        if (response.status_code >= 200 and response.status_code < 300) return;
+        log.err(
+            "Discord API {s} failed: status={d} body={s}",
+            .{ action, response.status_code, response.body[0..@min(response.body.len, 256)] },
+        );
+        return error.DiscordApiError;
+    }
+
+    fn parseResponseMessageId(self: *DiscordChannel, response_body: []const u8) ![]u8 {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, response_body, .{}) catch {
+            return error.DiscordApiError;
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.DiscordApiError;
+        const message_id = jsonString(parsed.value.object, "id") orelse return error.DiscordApiError;
+        if (message_id.len == 0) return error.DiscordApiError;
+        return self.allocator.dupe(u8, message_id);
+    }
+
     // ── Channel vtable ──────────────────────────────────────────────
 
     /// Send a message to a Discord channel via REST API.
@@ -579,31 +719,159 @@ pub const DiscordChannel = struct {
         if (reply_message_id) |message_id| {
             try body_list.appendSlice(allocator, ",\"message_reference\":{\"message_id\":");
             try root.json_util.appendJsonString(&body_list, allocator, message_id);
-            try body_list.appendSlice(allocator, ",\"fail_if_not_exists\":false}");
+            try body_list.appendSlice(allocator, ",\"fail_if_not_exists\":false},\"allowed_mentions\":{\"replied_user\":false}");
         }
         try body_list.appendSlice(allocator, "}");
 
         return try body_list.toOwnedSlice(allocator);
     }
 
-    fn sendChunk(self: *DiscordChannel, channel_id: []const u8, text: []const u8, reply_message_id: ?[]const u8) !void {
+    fn buildEditBody(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(allocator);
+
+        try body_list.appendSlice(allocator, "{\"content\":");
+        try root.json_util.appendJsonString(&body_list, allocator, text);
+        try body_list.appendSlice(allocator, ",\"allowed_mentions\":{\"replied_user\":false}}");
+        return try body_list.toOwnedSlice(allocator);
+    }
+
+    fn createMessageParsed(self: *DiscordChannel, channel_id: []const u8, reply_message_id: ?[]const u8, text: []const u8) ![]u8 {
+        if (builtin.is_test) {
+            return (try self.recordTestRequest(.create, channel_id, null, reply_message_id, text)).?;
+        }
+
         var url_buf: [256]u8 = undefined;
         const url = try sendUrl(&url_buf, channel_id);
 
         const body = try buildSendBody(self.allocator, text, reply_message_id);
         defer self.allocator.free(body);
 
-        // Build auth header value: "Authorization: Bot <token>"
         var auth_buf: [512]u8 = undefined;
         var auth_fbs = std.io.fixedBufferStream(&auth_buf);
         try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
         const auth_header = auth_fbs.getWritten();
 
-        const resp = root.http_util.curlPost(self.allocator, url, body, &.{auth_header}) catch |err| {
+        const resp = root.http_util.curlPostWithStatus(self.allocator, url, body, &.{auth_header}) catch |err| {
             log.err("Discord API POST failed: {}", .{err});
             return error.DiscordApiError;
         };
-        self.allocator.free(resp);
+        defer self.allocator.free(resp.body);
+        try ensureSuccessfulApiResponse("create message", resp);
+        return self.parseResponseMessageId(resp.body);
+    }
+
+    fn editMessageContent(self: *DiscordChannel, channel_id: []const u8, message_id: []const u8, text: []const u8) !void {
+        if (builtin.is_test) {
+            _ = try self.recordTestRequest(.edit, channel_id, message_id, null, text);
+            return;
+        }
+
+        var url_buf: [320]u8 = undefined;
+        const url = try editUrl(&url_buf, channel_id, message_id);
+
+        const body = try buildEditBody(self.allocator, text);
+        defer self.allocator.free(body);
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
+        const auth_header = auth_fbs.getWritten();
+
+        const resp = root.http_util.curlPatchWithStatus(self.allocator, url, body, &.{auth_header}) catch |err| {
+            log.err("Discord API PATCH failed: {}", .{err});
+            return error.DiscordApiError;
+        };
+        defer self.allocator.free(resp.body);
+        try ensureSuccessfulApiResponse("edit message", resp);
+    }
+
+    fn sendChunk(self: *DiscordChannel, channel_id: []const u8, text: []const u8, reply_message_id: ?[]const u8) !void {
+        const created_message_id = try self.createMessageParsed(channel_id, reply_message_id, text);
+        self.allocator.free(created_message_id);
+    }
+
+    fn flushDraftChunk(self: *DiscordChannel, target: []const u8, state: *DraftState) !void {
+        const display_text = firstMessageChunk(state.buffer.items);
+        if (display_text.len == 0) return;
+
+        const parsed_target = try parseTarget(target);
+        if (state.draft_message_id) |message_id| {
+            try self.editMessageContent(parsed_target.channel_id, message_id, display_text);
+        } else {
+            state.draft_message_id = try self.createMessageParsed(parsed_target.channel_id, parsed_target.reply_message_id, display_text);
+        }
+
+        state.last_flush_len = display_text.len;
+        state.last_flush_time = std.time.milliTimestamp();
+        state.overflowed = state.buffer.items.len > MAX_MESSAGE_LEN;
+    }
+
+    fn handleStreamingChunk(self: *DiscordChannel, target: []const u8, message: []const u8) !void {
+        if (message.len == 0) return;
+
+        self.draft_mu.lock();
+        defer self.draft_mu.unlock();
+
+        const gop = try self.draft_states.getOrPut(self.allocator, target);
+        if (!gop.found_existing) {
+            const key_copy = try self.allocator.dupe(u8, target);
+            gop.key_ptr.* = key_copy;
+            gop.value_ptr.* = .{};
+        }
+
+        const state = gop.value_ptr;
+        try state.buffer.appendSlice(self.allocator, message);
+
+        const display_text = firstMessageChunk(state.buffer.items);
+        if (display_text.len == 0) return;
+
+        const delta = display_text.len - state.last_flush_len;
+        const now_ms = std.time.milliTimestamp();
+        const elapsed_ms = now_ms - state.last_flush_time;
+        const buffer_overflowed = state.buffer.items.len > MAX_MESSAGE_LEN;
+
+        const should_flush = if (state.draft_message_id == null)
+            true
+        else
+            delta > 0 and (buffer_overflowed or delta >= DRAFT_FLUSH_MIN_DELTA_BYTES or elapsed_ms >= DRAFT_FLUSH_MIN_INTERVAL_MS);
+        if (!should_flush) return;
+
+        try self.flushDraftChunk(target, state);
+    }
+
+    fn handleStreamingFinal(self: *DiscordChannel, target: []const u8, message: []const u8) !void {
+        var draft_state: ?DraftState = null;
+        var draft_key: ?[]u8 = null;
+
+        self.draft_mu.lock();
+        if (self.draft_states.fetchRemove(target)) |entry| {
+            draft_key = @constCast(entry.key);
+            draft_state = entry.value;
+        }
+        self.draft_mu.unlock();
+
+        defer if (draft_key) |key| self.allocator.free(key);
+        defer if (draft_state) |*state| state.deinit(self.allocator);
+
+        if (draft_state == null) {
+            if (message.len > 0) try self.sendMessage(target, message);
+            return;
+        }
+        if (message.len == 0) return;
+
+        const parsed_target = try parseTarget(target);
+        if (draft_state.?.draft_message_id) |draft_message_id| {
+            var it = root.splitMessage(message, MAX_MESSAGE_LEN);
+            const first_chunk = it.next() orelse return;
+            try self.editMessageContent(parsed_target.channel_id, draft_message_id, first_chunk);
+            while (it.next()) |chunk| {
+                try self.sendChunk(parsed_target.channel_id, chunk, null);
+            }
+            return;
+        }
+
+        try self.sendMessage(target, message);
     }
 
     // ── Gateway ──────────────────────────────────────────────────────
@@ -619,6 +887,7 @@ pub const DiscordChannel = struct {
         self.running.store(false, .release);
         self.heartbeat_stop.store(true, .release);
         self.stopAllTyping();
+        self.deinitDraftStates();
         // Close socket to unblock blocking read
         const fd = self.ws_fd.load(.acquire);
         if (fd != invalid_socket) {
@@ -646,11 +915,26 @@ pub const DiscordChannel = struct {
             self.bot_user_id = null;
         }
         self.clearThreadCaches();
+        self.deinitTestTransport();
     }
 
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
         try self.sendMessage(target, message);
+    }
+
+    fn vtableSendEvent(
+        ptr: *anyopaque,
+        target: []const u8,
+        message: []const u8,
+        _: []const []const u8,
+        stage: root.Channel.OutboundStage,
+    ) anyerror!void {
+        const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
+        switch (stage) {
+            .chunk => try self.handleStreamingChunk(target, message),
+            .final => try self.handleStreamingFinal(target, message),
+        }
     }
 
     fn vtableName(ptr: *anyopaque) []const u8 {
@@ -677,6 +961,7 @@ pub const DiscordChannel = struct {
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
+        .sendEvent = &vtableSendEvent,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
         .startTyping = &vtableStartTyping,
@@ -1388,6 +1673,12 @@ test "discord typing url" {
     try std.testing.expectEqualStrings("https://discord.com/api/v10/channels/123456/typing", url);
 }
 
+test "discord edit url" {
+    var buf: [320]u8 = undefined;
+    const url = try DiscordChannel.editUrl(&buf, "123456", "m-42");
+    try std.testing.expectEqualStrings("https://discord.com/api/v10/channels/123456/messages/m-42", url);
+}
+
 test "discord sendTypingIndicator is no-op in tests" {
     var ch = DiscordChannel.init(std.testing.allocator, "my-bot-token", null, false);
     ch.sendTypingIndicator("123456");
@@ -1565,6 +1856,7 @@ test "discord buildSendBody includes message_reference for replies" {
     try std.testing.expect(std.mem.indexOf(u8, reply, "\"message_reference\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "\"message_id\":\"msg-42\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, reply, "\"fail_if_not_exists\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reply, "\"replied_user\":false") != null);
 }
 
 test "discord intents default" {
@@ -1594,6 +1886,73 @@ test "discord initFromConfig passes all fields" {
     try std.testing.expectEqual(@as(usize, 2), ch.mention_exempt_channel_ids.len);
     try std.testing.expectEqualStrings("c-allow", ch.mention_exempt_channel_ids[0]);
     try std.testing.expectEqual(@as(u32, 512), ch.intents);
+}
+
+test "discord sendEvent edits draft reply on final" {
+    const alloc = std.testing.allocator;
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+    });
+    defer ch.deinitDraftStates();
+    defer ch.deinitTestTransport();
+
+    const target = "channel:c-1:reply:msg-1";
+
+    try ch.channel().sendEvent(target, "Hello", &.{}, .chunk);
+    try std.testing.expectEqual(@as(usize, 1), ch.test_transport.requests.items.len);
+    try std.testing.expect(ch.draft_states.get(target) != null);
+
+    const create_req = ch.test_transport.requests.items[0];
+    try std.testing.expectEqual(DiscordChannel.TestRequestKind.create, create_req.kind);
+    try std.testing.expectEqualStrings("c-1", create_req.channel_id);
+    try std.testing.expectEqualStrings("msg-1", create_req.reply_message_id.?);
+    try std.testing.expectEqualStrings("Hello", create_req.content);
+
+    try ch.channel().sendEvent(target, "Hello world", &.{}, .final);
+
+    try std.testing.expect(ch.draft_states.get(target) == null);
+    try std.testing.expectEqual(@as(usize, 2), ch.test_transport.requests.items.len);
+
+    const edit_req = ch.test_transport.requests.items[1];
+    try std.testing.expectEqual(DiscordChannel.TestRequestKind.edit, edit_req.kind);
+    try std.testing.expectEqualStrings("c-1", edit_req.channel_id);
+    try std.testing.expectEqualStrings("draft-1", edit_req.message_id.?);
+    try std.testing.expectEqualStrings("Hello world", edit_req.content);
+}
+
+test "discord sendEvent final overflow edits draft then sends remainder" {
+    const alloc = std.testing.allocator;
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+    });
+    defer ch.deinitDraftStates();
+    defer ch.deinitTestTransport();
+
+    const target = "channel:c-1:reply:msg-1";
+
+    try ch.channel().sendEvent(target, "seed", &.{}, .chunk);
+
+    const long_text = try alloc.alloc(u8, DiscordChannel.MAX_MESSAGE_LEN + 1);
+    defer alloc.free(long_text);
+    @memset(long_text, 'a');
+
+    try ch.channel().sendEvent(target, long_text, &.{}, .final);
+
+    try std.testing.expect(ch.draft_states.get(target) == null);
+    try std.testing.expectEqual(@as(usize, 3), ch.test_transport.requests.items.len);
+
+    const edit_req = ch.test_transport.requests.items[1];
+    try std.testing.expectEqual(DiscordChannel.TestRequestKind.edit, edit_req.kind);
+    try std.testing.expectEqualStrings("draft-1", edit_req.message_id.?);
+    try std.testing.expectEqual(@as(usize, DiscordChannel.MAX_MESSAGE_LEN), edit_req.content.len);
+
+    const remainder_req = ch.test_transport.requests.items[2];
+    try std.testing.expectEqual(DiscordChannel.TestRequestKind.create, remainder_req.kind);
+    try std.testing.expectEqualStrings("c-1", remainder_req.channel_id);
+    try std.testing.expect(remainder_req.reply_message_id == null);
+    try std.testing.expectEqualStrings("a", remainder_req.content);
 }
 
 test "discord handleMessageCreate publishes inbound guild message with metadata" {

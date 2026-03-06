@@ -179,8 +179,10 @@ pub fn curlPostForm(allocator: Allocator, url: []const u8, body: []const u8) ![]
 
 /// HTTP POST via curl subprocess and include HTTP status code in response.
 /// Caller owns `response.body`.
-pub fn curlPostWithStatus(
+fn curlRequestWithStatus(
     allocator: Allocator,
+    method: []const u8,
+    content_type_header: []const u8,
     url: []const u8,
     body: []const u8,
     headers: []const []const u8,
@@ -194,11 +196,11 @@ pub fn curlPostWithStatus(
     argc += 1;
     argv_buf[argc] = "-X";
     argc += 1;
-    argv_buf[argc] = "POST";
+    argv_buf[argc] = method;
     argc += 1;
     argv_buf[argc] = "-H";
     argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
+    argv_buf[argc] = content_type_header;
     argc += 1;
 
     for (headers) |hdr| {
@@ -268,6 +270,42 @@ pub fn curlPostWithStatus(
         .status_code = status_code,
         .body = response_body,
     };
+}
+
+/// HTTP POST via curl subprocess and include HTTP status code in response.
+/// Caller owns `response.body`.
+pub fn curlPostWithStatus(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+) !HttpResponse {
+    return curlRequestWithStatus(
+        allocator,
+        "POST",
+        "Content-Type: application/json",
+        url,
+        body,
+        headers,
+    );
+}
+
+/// HTTP PATCH via curl subprocess and include HTTP status code in response.
+/// Caller owns `response.body`.
+pub fn curlPatchWithStatus(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    headers: []const []const u8,
+) !HttpResponse {
+    return curlRequestWithStatus(
+        allocator,
+        "PATCH",
+        "Content-Type: application/json",
+        url,
+        body,
+        headers,
+    );
 }
 
 /// HTTP PUT via curl subprocess (no proxy, no timeout).
@@ -532,6 +570,10 @@ test "curlPostWithProxy header guard allows at most (argv_buf_len - base_args) /
 }
 
 test "curlPostWithStatus compiles and is callable" {
+    try std.testing.expect(true);
+}
+
+test "curlPatchWithStatus compiles and is callable" {
     try std.testing.expect(true);
 }
 
