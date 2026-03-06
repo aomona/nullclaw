@@ -1845,20 +1845,84 @@ pub fn freeSyncResult(allocator: std.mem.Allocator, result: *const SyncResult) v
 
 // ── Tests ───────────────────────────────────────────────────────
 
-fn runCommand(allocator: std.mem.Allocator, argv: []const []const u8) !void {
-    var child = std.process.Child.init(argv, allocator);
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch |err| switch (err) {
+fn runCommandWithEnv(
+    allocator: std.mem.Allocator,
+    argv: []const []const u8,
+    env_map: ?*const std.process.EnvMap,
+) !void {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = argv,
+        .env_map = env_map,
+        .max_output_bytes = 32 * 1024,
+    }) catch |err| switch (err) {
         error.FileNotFound => return error.CommandNotFound,
         else => return err,
     };
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
 
-    const term = try child.wait();
-    switch (term) {
-        .Exited => |code| if (code != 0) return error.CommandFailed,
+    switch (result.term) {
+        .Exited => |code| if (code != 0) {
+            if (result.stderr.len > 0) {
+                std.log.warn("skills test command failed: {s}", .{std.mem.trim(u8, result.stderr, " \t\r\n")});
+            }
+            return error.CommandFailed;
+        },
         else => return error.CommandFailed,
     }
+}
+
+fn runGitTestCommand(
+    allocator: std.mem.Allocator,
+    repo: []const u8,
+    git_args: []const []const u8,
+) !void {
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{ "git", "-C", repo });
+    try argv.appendSlice(allocator, git_args);
+
+    var env = try std.process.getEnvMap(allocator);
+    defer env.deinit();
+
+    const removed_env_keys = [_][]const u8{
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "GIT_ASKPASS",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_SSH_VARIANT",
+        "SSH_ASKPASS",
+    };
+    for (removed_env_keys) |key| env.remove(key);
+
+    const global_config_path = try std.fs.path.join(allocator, &.{ repo, ".git-test-global-config" });
+    defer allocator.free(global_config_path);
+    const config_file = try std.fs.createFileAbsolute(global_config_path, .{ .truncate = false });
+    config_file.close();
+
+    try env.put("GIT_CONFIG_GLOBAL", global_config_path);
+    try env.put("GIT_CONFIG_NOSYSTEM", "1");
+    try env.put("GIT_TERMINAL_PROMPT", "0");
+
+    try runCommandWithEnv(allocator, argv.items, &env);
 }
 
 test "parseManifest full JSON" {
@@ -2981,9 +3045,9 @@ test "installSkillFromGit installs from local git repository" {
     const repo = try std.fs.path.join(allocator, &.{ base, "repo" });
     defer allocator.free(repo);
 
-    try runCommand(allocator, &.{ "git", "-C", repo, "init" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "add", "skill.json", "SKILL.md" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+    try runGitTestCommand(allocator, repo, &.{"init"});
+    try runGitTestCommand(allocator, repo, &.{ "add", "skill.json", "SKILL.md" });
+    try runGitTestCommand(allocator, repo, &.{ "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
 
     try installSkillFromGit(allocator, repo, workspace, null);
 
@@ -3019,9 +3083,9 @@ test "installSkillFromGit supports root markdown-only repository" {
     const repo = try std.fs.path.join(allocator, &.{ base, "repo" });
     defer allocator.free(repo);
 
-    try runCommand(allocator, &.{ "git", "-C", repo, "init" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "add", "SKILL.md" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+    try runGitTestCommand(allocator, repo, &.{"init"});
+    try runGitTestCommand(allocator, repo, &.{ "add", "SKILL.md" });
+    try runGitTestCommand(allocator, repo, &.{ "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
 
     try installSkillFromGit(allocator, repo, workspace, null);
 
@@ -3066,9 +3130,9 @@ test "installSkillFromGit installs all skills from repository skills directory" 
     const repo = try std.fs.path.join(allocator, &.{ base, "repo" });
     defer allocator.free(repo);
 
-    try runCommand(allocator, &.{ "git", "-C", repo, "init" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "add", "skills/http_request/SKILL.md", "skills/review/SKILL.md", "README.md" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+    try runGitTestCommand(allocator, repo, &.{"init"});
+    try runGitTestCommand(allocator, repo, &.{ "add", "skills/http_request/SKILL.md", "skills/review/SKILL.md", "README.md" });
+    try runGitTestCommand(allocator, repo, &.{ "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
 
     try installSkillFromGit(allocator, repo, workspace, null);
 
@@ -3123,9 +3187,9 @@ test "installSkillFromGit installs SKILL.toml entry from repository skills direc
     const repo = try std.fs.path.join(allocator, &.{ base, "repo" });
     defer allocator.free(repo);
 
-    try runCommand(allocator, &.{ "git", "-C", repo, "init" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "add", "skills/toml_only/SKILL.toml" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+    try runGitTestCommand(allocator, repo, &.{"init"});
+    try runGitTestCommand(allocator, repo, &.{ "add", "skills/toml_only/SKILL.toml" });
+    try runGitTestCommand(allocator, repo, &.{ "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
 
     try installSkillFromGit(allocator, repo, workspace, null);
 
@@ -3169,9 +3233,9 @@ test "installSkillFromGit keeps clone directory name when manifest name differs"
     const repo = try std.fs.path.join(allocator, &.{ base, "repo" });
     defer allocator.free(repo);
 
-    try runCommand(allocator, &.{ "git", "-C", repo, "init" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "add", "skill.json", "SKILL.md", "assets/payload.txt" });
-    try runCommand(allocator, &.{ "git", "-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
+    try runGitTestCommand(allocator, repo, &.{"init"});
+    try runGitTestCommand(allocator, repo, &.{ "add", "skill.json", "SKILL.md", "assets/payload.txt" });
+    try runGitTestCommand(allocator, repo, &.{ "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init" });
 
     try installSkillFromGit(allocator, repo, workspace, null);
 
