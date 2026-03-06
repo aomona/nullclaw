@@ -742,7 +742,7 @@ fn inboundDispatcherThread(
             .event_bus = event_bus,
             .channel = msg.channel,
             .account_id = outbound_account_id,
-            .chat_id = msg.chat_id,
+            .chat_id = outbound_chat_id,
         };
         var stream_sink: ?streaming.Sink = null;
         var outbound_tag_filter: streaming.TagFilter = undefined;
@@ -1782,6 +1782,27 @@ test "channelUsesTagFilteredStreaming includes discord and telegram only" {
     try std.testing.expect(channelUsesTagFilteredStreaming("telegram"));
     try std.testing.expect(channelUsesTagFilteredStreaming("discord"));
     try std.testing.expect(!channelUsesTagFilteredStreaming("web"));
+}
+
+test "publishStreamingChunk preserves discord reply target" {
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ctx = StreamingOutboundCtx{
+        .allocator = std.testing.allocator,
+        .event_bus = &event_bus,
+        .channel = "discord",
+        .account_id = "dc-main",
+        .chat_id = "channel:1234567890:reply:9988776655",
+    };
+
+    publishStreamingChunk(@ptrCast(&ctx), .{ .stage = .chunk, .text = "hello" });
+
+    var msg = event_bus.consumeOutbound() orelse return error.TestUnexpectedResult;
+    defer msg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("channel:1234567890:reply:9988776655", msg.chat_id);
+    try std.testing.expectEqualStrings("dc-main", msg.account_id.?);
+    try std.testing.expect(msg.stage == .chunk);
 }
 
 test "hasSupervisedChannels true for nostr" {
