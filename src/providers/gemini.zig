@@ -38,6 +38,20 @@ fn parseTokenCount(v: std.json.Value) ?u32 {
     };
 }
 
+fn parseUnixTimestamp(v: std.json.Value) ?i64 {
+    return switch (v) {
+        .integer => |i| i,
+        .float => |f| blk: {
+            if (!std.math.isFinite(f)) break :blk null;
+            const min_i64_f: f64 = @floatFromInt(std.math.minInt(i64));
+            const max_i64_f: f64 = @floatFromInt(std.math.maxInt(i64));
+            if (f < min_i64_f or f > max_i64_f) break :blk null;
+            break :blk @intFromFloat(f);
+        },
+        else => null,
+    };
+}
+
 fn normalizeTokenUsage(usage: *root.TokenUsage) void {
     if (usage.total_tokens == 0 and (usage.prompt_tokens > 0 or usage.completion_tokens > 0)) {
         usage.total_tokens = usage.prompt_tokens +| usage.completion_tokens;
@@ -83,6 +97,7 @@ pub fn extractGeminiUsageMetadata(allocator: std.mem.Allocator, json_str: []cons
         return error.InvalidSseJson;
     defer parsed.deinit();
 
+    if (parsed.value != .object) return error.InvalidSseJson;
     const usage_val = parsed.value.object.get("usageMetadata") orelse return null;
     return parseUsageMetadataValue(usage_val);
 }
@@ -201,14 +216,21 @@ pub fn parseCredentialsJson(allocator: std.mem.Allocator, json_bytes: []const u8
         }
     } else null;
 
+    var success = false;
+    defer if (!success) {
+        allocator.free(access_token);
+        if (refresh_token) |rt| allocator.free(rt);
+    };
+
     // expires_at is optional (unix timestamp)
     const expires_at: ?i64 = if (root_obj.get("expires_at")) |ea_val| blk: {
-        switch (ea_val) {
-            .integer => |i| break :blk i,
-            .float => |f| break :blk @intFromFloat(f),
-            else => break :blk null,
+        if (parseUnixTimestamp(ea_val)) |expires_at| {
+            break :blk expires_at;
         }
+        return null;
     } else null;
+
+    success = true;
 
     return .{
         .access_token = access_token,
@@ -420,8 +442,7 @@ pub const GeminiAuth = union(enum) {
 
 /// Google Gemini provider with support for:
 /// - Direct API key (`GEMINI_API_KEY` env var or config)
-/// - Gemini CLI OAuth tokens (reuse existing ~/.gemini/ authentication)
-/// - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
+/// - OAuth bearer tokens (`GEMINI_OAUTH_TOKEN` or Gemini CLI credentials)
 pub const GeminiProvider = struct {
     auth: ?GeminiAuth,
     allocator: std.mem.Allocator,
@@ -582,22 +603,42 @@ pub const GeminiProvider = struct {
         message: []const u8,
         temperature: f64,
     ) ![]const u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+
+        try buf.appendSlice(allocator, "{\"contents\":[{\"role\":\"user\",\"parts\":[{\"text\":");
+        try root.appendJsonString(&buf, allocator, message);
+        try buf.appendSlice(allocator, "}]}]");
+
         if (system_prompt) |sys| {
-            return std.fmt.allocPrint(allocator,
-                \\{{"contents":[{{"role":"user","parts":[{{"text":"{s}"}}]}}],"system_instruction":{{"parts":[{{"text":"{s}"}}]}},"generationConfig":{{"temperature":{d:.2},"maxOutputTokens":{d}}}}}
-            , .{ message, sys, temperature, DEFAULT_MAX_OUTPUT_TOKENS });
-        } else {
-            return std.fmt.allocPrint(allocator,
-                \\{{"contents":[{{"role":"user","parts":[{{"text":"{s}"}}]}}],"generationConfig":{{"temperature":{d:.2},"maxOutputTokens":{d}}}}}
-            , .{ message, temperature, DEFAULT_MAX_OUTPUT_TOKENS });
+            try buf.appendSlice(allocator, ",\"system_instruction\":{\"parts\":[{\"text\":");
+            try root.appendJsonString(&buf, allocator, sys);
+            try buf.appendSlice(allocator, "}]}");
         }
+
+        try buf.appendSlice(allocator, ",\"generationConfig\":{\"temperature\":");
+
+        var temp_buf: [16]u8 = undefined;
+        const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.GeminiApiError;
+        try buf.appendSlice(allocator, temp_str);
+        try buf.appendSlice(allocator, ",\"maxOutputTokens\":");
+
+        var max_buf: [16]u8 = undefined;
+        const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{DEFAULT_MAX_OUTPUT_TOKENS}) catch return error.GeminiApiError;
+        try buf.appendSlice(allocator, max_str);
+        try buf.appendSlice(allocator, "}}");
+
+        return try buf.toOwnedSlice(allocator);
     }
 
     /// Parse text and token usage from a Gemini generateContent response.
     pub fn parseChatResponse(allocator: std.mem.Allocator, body: []const u8) !ChatResponse {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
         defer parsed.deinit();
-        const root_obj = parsed.value.object;
+        const root_obj = switch (parsed.value) {
+            .object => |obj| obj,
+            else => return error.NoResponseContent,
+        };
 
         // Check for error first
         if (error_classify.classifyKnownApiError(root_obj)) |kind| {
@@ -612,28 +653,40 @@ pub const GeminiProvider = struct {
         }
 
         // Extract text from candidates
-        if (root_obj.get("candidates")) |candidates| {
-            if (candidates.array.items.len > 0) {
-                const candidate = candidates.array.items[0].object;
-                if (candidate.get("content")) |content| {
-                    if (content.object.get("parts")) |parts| {
-                        if (parts.array.items.len > 0) {
-                            const part = parts.array.items[0].object;
-                            if (part.get("text")) |text| {
-                                if (text == .string) {
-                                    return .{
-                                        .content = try allocator.dupe(u8, text.string),
-                                        .usage = usage,
-                                    };
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        const candidates_val = root_obj.get("candidates") orelse return error.NoResponseContent;
+        const candidates = switch (candidates_val) {
+            .array => |arr| arr,
+            else => return error.NoResponseContent,
+        };
+        if (candidates.items.len == 0) return error.NoResponseContent;
 
-        return error.NoResponseContent;
+        const candidate = switch (candidates.items[0]) {
+            .object => |obj| obj,
+            else => return error.NoResponseContent,
+        };
+        const content_val = candidate.get("content") orelse return error.NoResponseContent;
+        const content = switch (content_val) {
+            .object => |obj| obj,
+            else => return error.NoResponseContent,
+        };
+        const parts_val = content.get("parts") orelse return error.NoResponseContent;
+        const parts = switch (parts_val) {
+            .array => |arr| arr,
+            else => return error.NoResponseContent,
+        };
+        if (parts.items.len == 0) return error.NoResponseContent;
+
+        const part = switch (parts.items[0]) {
+            .object => |obj| obj,
+            else => return error.NoResponseContent,
+        };
+        const text = part.get("text") orelse return error.NoResponseContent;
+        if (text != .string or text.string.len == 0) return error.NoResponseContent;
+
+        return .{
+            .content = try allocator.dupe(u8, text.string),
+            .usage = usage,
+        };
     }
 
     /// Parse text content from a Gemini generateContent response.
@@ -680,7 +733,10 @@ pub const GeminiProvider = struct {
             return error.InvalidSseJson;
         defer parsed.deinit();
 
-        const obj = parsed.value.object;
+        const obj = switch (parsed.value) {
+            .object => |root_obj| root_obj,
+            else => return error.InvalidSseJson,
+        };
         const candidates = obj.get("candidates") orelse return null;
         if (candidates != .array or candidates.array.items.len == 0) return null;
 
@@ -1203,6 +1259,28 @@ test "buildRequestBody without system" {
     try std.testing.expect(std.mem.indexOf(u8, body, "system_instruction") == null);
 }
 
+test "buildRequestBody escapes special characters" {
+    const alloc = std.testing.allocator;
+    const body = try GeminiProvider.buildRequestBody(
+        alloc,
+        "System says \"stay helpful\"\\now",
+        "Hello\n\"Gemini\"\\path",
+        0.7,
+    );
+    defer alloc.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+
+    const root_obj = parsed.value.object;
+    const contents = root_obj.get("contents").?.array;
+    const parts = contents.items[0].object.get("parts").?.array;
+    try std.testing.expectEqualStrings("Hello\n\"Gemini\"\\path", parts.items[0].object.get("text").?.string);
+
+    const system_parts = root_obj.get("system_instruction").?.object.get("parts").?.array;
+    try std.testing.expectEqualStrings("System says \"stay helpful\"\\now", system_parts.items[0].object.get("text").?.string);
+}
+
 test "parseResponse extracts text" {
     const body =
         \\{"candidates":[{"content":{"parts":[{"text":"Hello there!"}]}}]}
@@ -1222,6 +1300,10 @@ test "parseChatResponse extracts usageMetadata token counts" {
     try std.testing.expectEqual(@as(u32, 12), response.usage.prompt_tokens);
     try std.testing.expectEqual(@as(u32, 34), response.usage.completion_tokens);
     try std.testing.expectEqual(@as(u32, 46), response.usage.total_tokens);
+}
+
+test "parseChatResponse rejects non-object payload" {
+    try std.testing.expectError(error.NoResponseContent, GeminiProvider.parseChatResponse(std.testing.allocator, "[]"));
 }
 
 test "extractGeminiUsageMetadata derives missing total from prompt and completion" {
@@ -1371,6 +1453,10 @@ test "extractGeminiUsageFromSseLine parses usageMetadata" {
     try std.testing.expectEqual(@as(u32, 12), usage.total_tokens);
 }
 
+test "extractGeminiUsageMetadata rejects non-object json" {
+    try std.testing.expectError(error.InvalidSseJson, extractGeminiUsageMetadata(std.testing.allocator, "[]"));
+}
+
 test "parseGeminiSseLine empty line" {
     const result = try GeminiProvider.parseGeminiSseLine(std.testing.allocator, "");
     try std.testing.expect(result == .skip);
@@ -1380,6 +1466,13 @@ test "parseGeminiSseLine invalid json returns error" {
     try std.testing.expectError(
         error.InvalidSseJson,
         GeminiProvider.parseGeminiSseLine(std.testing.allocator, "data: not-json"),
+    );
+}
+
+test "parseGeminiSseLine non-object json returns error" {
+    try std.testing.expectError(
+        error.InvalidSseJson,
+        GeminiProvider.parseGeminiSseLine(std.testing.allocator, "data: []"),
     );
 }
 
@@ -1516,6 +1609,14 @@ test "parseCredentialsJson empty access_token returns null" {
 
 test "parseCredentialsJson invalid JSON returns null" {
     const result = parseCredentialsJson(std.testing.allocator, "not json at all");
+    try std.testing.expect(result == null);
+}
+
+test "parseCredentialsJson rejects out-of-range expires_at float" {
+    const json =
+        \\{"access_token":"ya29.token","expires_at":1e100}
+    ;
+    const result = parseCredentialsJson(std.testing.allocator, json);
     try std.testing.expect(result == null);
 }
 

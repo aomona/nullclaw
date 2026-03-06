@@ -51,6 +51,8 @@ pub const DiscordChannel = struct {
     bot_user_id: ?[]u8 = null,
     gateway_thread: ?std.Thread = null,
     ws_fd: Atomic(SocketFd) = Atomic(SocketFd).init(invalid_socket),
+    ready_seen: Atomic(bool) = Atomic(bool).init(false),
+    last_gateway_packet_ms: Atomic(i64) = Atomic(i64).init(0),
 
     const SocketFd = std.net.Stream.Handle;
     const invalid_socket: SocketFd = switch (builtin.os.tag) {
@@ -208,8 +210,19 @@ pub const DiscordChannel = struct {
         return token[0..dot_pos];
     }
 
-    pub fn healthCheck(_: *DiscordChannel) bool {
-        return true;
+    pub fn healthCheck(self: *DiscordChannel) bool {
+        if (!self.running.load(.acquire)) return false;
+        if (!self.ready_seen.load(.acquire)) return false;
+
+        const last_packet_ms = self.last_gateway_packet_ms.load(.acquire);
+        if (last_packet_ms <= 0) return false;
+
+        const now_ms = std.time.milliTimestamp();
+        const age_ms: u64 = @intCast(@max(@as(i64, 0), now_ms - last_packet_ms));
+        const heartbeat_interval_ms = self.heartbeat_interval_ms.load(.acquire);
+        const stale_threshold_ms: u64 = @max(@as(u64, 60_000), heartbeat_interval_ms *| 3);
+
+        return age_ms <= stale_threshold_ms;
     }
 
     pub fn setBus(self: *DiscordChannel, b: *bus_mod.Bus) void {
@@ -285,6 +298,88 @@ pub const DiscordChannel = struct {
         };
 
         return no_scheme[0..end];
+    }
+
+    fn componentAsSlice(component: std.Uri.Component) []const u8 {
+        return switch (component) {
+            .raw => |v| v,
+            .percent_encoded => |v| v,
+        };
+    }
+
+    fn parseGatewayConnectParts(
+        socket_url: []const u8,
+        host_buf: []u8,
+        path_buf: []u8,
+    ) !struct { host: []const u8, port: u16, path: []const u8 } {
+        const uri = std.Uri.parse(socket_url) catch return error.InvalidGatewayUrl;
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "wss")) return error.InvalidGatewayUrl;
+
+        const host = uri.getHost(host_buf) catch return error.InvalidGatewayUrl;
+        const port = uri.port orelse 443;
+        const raw_path = componentAsSlice(uri.path);
+        const query = if (uri.query) |q| componentAsSlice(q) else "";
+
+        var fbs = std.io.fixedBufferStream(path_buf);
+        const w = fbs.writer();
+        if (raw_path.len == 0) {
+            try w.writeByte('/');
+        } else {
+            if (raw_path[0] != '/') try w.writeByte('/');
+            try w.writeAll(raw_path);
+        }
+        if (query.len > 0) {
+            try w.writeByte('?');
+            try w.writeAll(query);
+        }
+
+        return .{
+            .host = host,
+            .port = port,
+            .path = fbs.getWritten(),
+        };
+    }
+
+    fn hasImageFilenameExtension(filename: []const u8) bool {
+        const exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif" };
+        for (exts) |ext| {
+            if (filename.len >= ext.len and std.ascii.eqlIgnoreCase(filename[filename.len - ext.len ..], ext)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn isAllowedAttachmentUrl(url: []const u8) bool {
+        const uri = std.Uri.parse(url) catch return false;
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return false;
+
+        var host_buf: [256]u8 = undefined;
+        const host = uri.getHost(&host_buf) catch return false;
+        return std.ascii.eqlIgnoreCase(host, "cdn.discordapp.com") or
+            std.ascii.eqlIgnoreCase(host, "media.discordapp.net");
+    }
+
+    fn isImageAttachment(att_obj: std.json.ObjectMap) bool {
+        if (jsonString(att_obj, "content_type")) |content_type| {
+            return content_type.len >= "image/".len and
+                std.ascii.eqlIgnoreCase(content_type[0.."image/".len], "image/");
+        }
+        if (jsonString(att_obj, "filename")) |filename| {
+            return hasImageFilenameExtension(filename);
+        }
+        return false;
+    }
+
+    fn appendImageAttachmentMarker(
+        allocator: std.mem.Allocator,
+        content_buf: *std.ArrayListUnmanaged(u8),
+        url: []const u8,
+    ) !void {
+        if (content_buf.items.len > 0) try content_buf.appendSlice(allocator, "\n");
+        try content_buf.appendSlice(allocator, "[IMAGE:");
+        try content_buf.appendSlice(allocator, url);
+        try content_buf.appendSlice(allocator, "]");
     }
 
     /// Check if bot is mentioned in message content.
@@ -987,6 +1082,9 @@ pub const DiscordChannel = struct {
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
         self.running.store(true, .release);
+        self.ready_seen.store(false, .release);
+        self.last_gateway_packet_ms.store(0, .release);
+        self.heartbeat_interval_ms.store(0, .release);
         self.outbound_event_mu.lock();
         self.outbound_worker_stop = false;
         self.outbound_event_mu.unlock();
@@ -1008,6 +1106,8 @@ pub const DiscordChannel = struct {
         const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
         self.running.store(false, .release);
         self.heartbeat_stop.store(true, .release);
+        self.ready_seen.store(false, .release);
+        self.last_gateway_packet_ms.store(0, .release);
         self.stopAllTyping();
         self.outbound_event_mu.lock();
         self.outbound_worker_stop = true;
@@ -1131,15 +1231,24 @@ pub const DiscordChannel = struct {
     }
 
     fn runGatewayOnce(self: *DiscordChannel) !void {
-        // Determine host
-        const default_host = "gateway.discord.gg";
-        const host: []const u8 = if (self.resume_gateway_url) |u| parseGatewayHost(u) else default_host;
+        self.ready_seen.store(false, .release);
+        self.last_gateway_packet_ms.store(0, .release);
+
+        var host_buf: [256]u8 = undefined;
+        var path_buf: [512]u8 = undefined;
+        const gateway_parts = if (self.resume_gateway_url) |resume_url|
+            parseGatewayConnectParts(resume_url, &host_buf, &path_buf) catch blk: {
+                log.warn("Discord: invalid resume gateway URL, falling back to default: {s}", .{resume_url});
+                break :blk try parseGatewayConnectParts(GATEWAY_URL, &host_buf, &path_buf);
+            }
+        else
+            try parseGatewayConnectParts(GATEWAY_URL, &host_buf, &path_buf);
 
         var ws = try websocket.WsClient.connect(
             self.allocator,
-            host,
-            443,
-            "/?v=10&encoding=json",
+            gateway_parts.host,
+            gateway_parts.port,
+            gateway_parts.path,
             &.{},
         );
 
@@ -1222,6 +1331,8 @@ pub const DiscordChannel = struct {
         const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, text, .{});
         defer parsed.deinit();
 
+        self.last_gateway_packet_ms.store(std.time.milliTimestamp(), .release);
+
         const root_val = parsed.value;
         if (root_val != .object) return;
         const d_val = root_val.object.get("d") orelse return;
@@ -1259,6 +1370,8 @@ pub const DiscordChannel = struct {
             log.warn("Discord: gateway message root is not an object", .{});
             return;
         }
+
+        self.last_gateway_packet_ms.store(std.time.milliTimestamp(), .release);
 
         // Get op code
         const op_val = root_val.object.get("op") orelse {
@@ -1303,6 +1416,8 @@ pub const DiscordChannel = struct {
                     self.handleReady(root_val) catch |err| {
                         log.warn("Discord: handleReady error: {}", .{err});
                     };
+                } else if (std.mem.eql(u8, event_type, "RESUMED")) {
+                    self.ready_seen.store(true, .release);
                 } else if (std.mem.eql(u8, event_type, "GUILD_CREATE")) {
                     self.handleGuildCreate(root_val) catch |err| {
                         log.warn("Discord: handleGuildCreate error: {}", .{err});
@@ -1386,6 +1501,8 @@ pub const DiscordChannel = struct {
             self.resume_gateway_url = null;
         }
         self.sequence.store(0, .release);
+        self.ready_seen.store(false, .release);
+        self.last_gateway_packet_ms.store(0, .release);
     }
 
     fn resolveInvalidSessionAction(self: *DiscordChannel, resumable: bool) InvalidSessionAction {
@@ -1453,6 +1570,7 @@ pub const DiscordChannel = struct {
             }
         }
 
+        self.ready_seen.store(true, .release);
         log.info("Discord READY: session_id={s}", .{self.session_id orelse "<none>"});
     }
 
@@ -1668,45 +1786,19 @@ pub const DiscordChannel = struct {
         defer content_buf.deinit(self.allocator);
 
         if (content.len > 0) {
-            content_buf.appendSlice(self.allocator, content) catch {};
+            try content_buf.appendSlice(self.allocator, content);
         }
 
         if (d_obj.get("attachments")) |att_val| {
             if (att_val == .array) {
-                var rand = std.crypto.random;
                 for (att_val.array.items) |att_item| {
-                    if (att_item == .object) {
-                        if (att_item.object.get("url")) |url_val| {
-                            if (url_val == .string) {
-                                const attach_url = url_val.string;
+                    if (att_item != .object) continue;
+                    if (!isImageAttachment(att_item.object)) continue;
 
-                                // Download it
-                                if (root.http_util.curlGet(self.allocator, attach_url, &.{}, "30")) |img_data| {
-                                    defer self.allocator.free(img_data);
+                    const attach_url = jsonString(att_item.object, "url") orelse continue;
+                    if (!isAllowedAttachmentUrl(attach_url)) continue;
 
-                                    // Make temp file
-                                    const rand_id = rand.int(u64);
-                                    var path_buf: [1024]u8 = undefined;
-                                    const local_path = std.fmt.bufPrint(&path_buf, "/tmp/discord_{x}.dat", .{rand_id}) catch continue;
-
-                                    if (std.fs.createFileAbsolute(local_path, .{ .read = false })) |file| {
-                                        file.writeAll(img_data) catch {
-                                            file.close();
-                                            continue;
-                                        };
-                                        file.close();
-
-                                        if (content_buf.items.len > 0) content_buf.appendSlice(self.allocator, "\n") catch {};
-                                        content_buf.appendSlice(self.allocator, "[IMAGE:") catch {};
-                                        content_buf.appendSlice(self.allocator, local_path) catch {};
-                                        content_buf.appendSlice(self.allocator, "]") catch {};
-                                    } else |_| {}
-                                } else |err| {
-                                    log.warn("Discord: failed to download attachment: {}", .{err});
-                                }
-                            }
-                        }
-                    }
+                    try appendImageAttachmentMarker(self.allocator, &content_buf, attach_url);
                 }
             }
         }
@@ -1817,6 +1909,25 @@ test "discord parseRetryAfterNs handles integer and float seconds" {
     try std.testing.expectEqual(@as(?u64, 2 * std.time.ns_per_s), DiscordChannel.parseRetryAfterNs(alloc, "{\"retry_after\":2}"));
     try std.testing.expectEqual(@as(?u64, 250_000_000), DiscordChannel.parseRetryAfterNs(alloc, "{\"retry_after\":0.25}"));
     try std.testing.expectEqual(@as(?u64, null), DiscordChannel.parseRetryAfterNs(alloc, "{}"));
+}
+
+test "discord healthCheck requires ready and recent gateway traffic" {
+    var ch = DiscordChannel.init(std.testing.allocator, "token", null, false);
+
+    try std.testing.expect(!ch.healthCheck());
+
+    ch.running.store(true, .release);
+    try std.testing.expect(!ch.healthCheck());
+
+    const now_ms = std.time.milliTimestamp();
+    ch.ready_seen.store(true, .release);
+    ch.last_gateway_packet_ms.store(now_ms, .release);
+    ch.heartbeat_interval_ms.store(20_000, .release);
+    try std.testing.expect(ch.healthCheck());
+
+    ch.last_gateway_packet_ms.store(now_ms - 61_000, .release);
+    ch.heartbeat_interval_ms.store(1_000, .release);
+    try std.testing.expect(!ch.healthCheck());
 }
 
 test "discord sendTypingIndicator is no-op in tests" {
@@ -1960,6 +2071,19 @@ test "discord parseGatewayHost with path" {
 test "discord parseGatewayHost no scheme returns original" {
     const host = DiscordChannel.parseGatewayHost("gateway.discord.gg");
     try std.testing.expectEqualStrings("gateway.discord.gg", host);
+}
+
+test "discord parseGatewayConnectParts preserves custom path and query" {
+    var host_buf: [128]u8 = undefined;
+    var path_buf: [256]u8 = undefined;
+    const parts = try DiscordChannel.parseGatewayConnectParts(
+        "wss://gateway.discord.gg/gateway?encoding=json&v=10&compress=zlib-stream",
+        &host_buf,
+        &path_buf,
+    );
+    try std.testing.expectEqualStrings("gateway.discord.gg", parts.host);
+    try std.testing.expectEqual(@as(u16, 443), parts.port);
+    try std.testing.expectEqualStrings("/gateway?encoding=json&v=10&compress=zlib-stream", parts.path);
 }
 
 test "discord isMentioned with user id" {
@@ -2136,6 +2260,57 @@ test "discord handleMessageCreate publishes inbound guild message with metadata"
     try std.testing.expectEqualStrings("c-1", meta.value.object.get("channel_id").?.string);
     try std.testing.expectEqualStrings("m-1", meta.value.object.get("message_id").?.string);
     try std.testing.expectEqualStrings("g-1", meta.value.object.get("guild_id").?.string);
+}
+
+test "discord handleMessageCreate appends allowed image attachment marker" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+    });
+    ch.setBus(&event_bus);
+
+    const msg_json =
+        \\{"d":{"id":"m-attach-1","channel_id":"c-1","guild_id":"g-1","content":"hello","attachments":[{"url":"https://cdn.discordapp.com/attachments/a/b/cat.png","content_type":"image/png","filename":"cat.png"}],"author":{"id":"u-1","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+
+    var msg = event_bus.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "hello\n[IMAGE:https://cdn.discordapp.com/attachments/a/b/cat.png]",
+        msg.content,
+    );
+}
+
+test "discord handleMessageCreate ignores disallowed or non-image attachments" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+    });
+    ch.setBus(&event_bus);
+
+    const msg_json =
+        \\{"d":{"id":"m-attach-2","channel_id":"c-1","guild_id":"g-1","content":"hello","attachments":[{"url":"https://evil.example.com/cat.png","content_type":"image/png","filename":"cat.png"},{"url":"https://cdn.discordapp.com/attachments/a/b/note.txt","content_type":"text/plain","filename":"note.png"}],"author":{"id":"u-1","bot":false}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+
+    var msg = event_bus.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("hello", msg.content);
 }
 
 test "discord handleMessageCreate sets is_dm metadata for direct messages" {
@@ -2529,6 +2704,20 @@ test "discord dispatch sequence accepts lower values after session reset" {
     try ch.handleGatewayMessage(&ws_dummy, ready_dispatch);
 
     try std.testing.expectEqual(@as(i64, 1), ch.sequence.load(.acquire));
+}
+
+test "discord resumed dispatch marks channel ready" {
+    var ch = DiscordChannel.init(std.testing.allocator, "token", null, false);
+    var ws_dummy: websocket.WsClient = undefined;
+
+    const resumed_dispatch =
+        \\{"op":0,"s":2,"t":"RESUMED","d":{}}
+    ;
+    try ch.handleGatewayMessage(&ws_dummy, resumed_dispatch);
+
+    try std.testing.expect(ch.ready_seen.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 2), ch.sequence.load(.acquire));
+    try std.testing.expect(ch.last_gateway_packet_ms.load(.acquire) > 0);
 }
 
 test "discord invalid session non-resumable clears state and identifies" {
