@@ -4,11 +4,13 @@ const root = @import("root.zig");
 const error_classify = @import("error_classify.zig");
 const config_types = @import("../config_types.zig");
 const http_util = @import("../http_util.zig");
+const log = std.log.scoped(.gemini);
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
 const OAUTH_REFRESH_TIMEOUT_SECS: u64 = 20;
+const MAX_STREAM_ERROR_CAPTURE_BYTES: usize = 8 * 1024;
 
 fn parseExpiresIn(v: std.json.Value) ?i64 {
     return switch (v) {
@@ -100,6 +102,67 @@ pub fn extractGeminiUsageMetadata(allocator: std.mem.Allocator, json_str: []cons
     if (parsed.value != .object) return error.InvalidSseJson;
     const usage_val = parsed.value.object.get("usageMetadata") orelse return null;
     return parseUsageMetadataValue(usage_val);
+}
+
+fn normalizeGeminiStreamPayload(line: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len == 0 or trimmed[0] == ':') return "";
+
+    const prefix = "data: ";
+    if (std.mem.startsWith(u8, trimmed, prefix)) return trimmed[prefix.len..];
+    return trimmed;
+}
+
+fn appendGeminiStreamErrorCandidate(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    line: []const u8,
+) !void {
+    if (buf.items.len >= MAX_STREAM_ERROR_CAPTURE_BYTES) return;
+
+    const payload = normalizeGeminiStreamPayload(line);
+    if (payload.len == 0) return;
+
+    if (buf.items.len > 0) {
+        try buf.append(allocator, '\n');
+    }
+
+    const remaining = MAX_STREAM_ERROR_CAPTURE_BYTES - buf.items.len;
+    if (remaining == 0) return;
+    try buf.appendSlice(allocator, payload[0..@min(payload.len, remaining)]);
+}
+
+fn classifyGeminiErrorPayload(allocator: std.mem.Allocator, payload: []const u8) ?anyerror {
+    const normalized = normalizeGeminiStreamPayload(payload);
+    if (normalized.len == 0) return null;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, normalized, .{}) catch return null;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return null;
+    const root_obj = parsed.value.object;
+
+    if (error_classify.classifyKnownApiError(root_obj)) |kind| {
+        return error_classify.kindToError(kind);
+    }
+
+    if (root_obj.get("error") != null or
+        root_obj.get("message") != null or
+        root_obj.get("status") != null or
+        root_obj.get("code") != null or
+        root_obj.get("type") != null)
+    {
+        return error.ApiError;
+    }
+
+    return null;
+}
+
+fn logGeminiApiError(allocator: std.mem.Allocator, stage: []const u8, payload: []const u8) void {
+    const sanitized = root.sanitizeApiError(allocator, payload) catch null;
+    defer if (sanitized) |body| allocator.free(body);
+
+    log.warn("gemini {s} upstream error: {s}", .{ stage, sanitized orelse "<api error body unavailable>" });
 }
 
 fn extractGeminiUsageFromSseLine(allocator: std.mem.Allocator, line: []const u8) !?root.TokenUsage {
@@ -782,6 +845,8 @@ pub const GeminiProvider = struct {
         argc += 1;
         argv_buf[argc] = "-s";
         argc += 1;
+        argv_buf[argc] = "--show-error";
+        argc += 1;
         argv_buf[argc] = "--no-buffer";
         argc += 1;
         argv_buf[argc] = "--fail-with-body";
@@ -833,7 +898,7 @@ pub const GeminiProvider = struct {
         var child = std.process.Child.init(argv_buf[0..argc], allocator);
         child.stdin_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
+        child.stderr_behavior = .Pipe;
 
         try child.spawn();
 
@@ -860,7 +925,11 @@ pub const GeminiProvider = struct {
         var line_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer line_buf.deinit(allocator);
 
+        var error_body_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer error_body_buf.deinit(allocator);
+
         var stream_usage = root.TokenUsage{};
+        var saw_delta = false;
         const file = child.stdout.?;
         var read_buf: [4096]u8 = undefined;
 
@@ -870,22 +939,25 @@ pub const GeminiProvider = struct {
 
             for (read_buf[0..n]) |byte| {
                 if (byte == '\n') {
-                    if (extractGeminiUsageFromSseLine(allocator, line_buf.items) catch null) |usage| {
+                    const current_line = line_buf.items;
+                    if (extractGeminiUsageFromSseLine(allocator, current_line) catch null) |usage| {
                         stream_usage = usage;
                     }
-                    const result = parseGeminiSseLine(allocator, line_buf.items) catch {
+                    const result = parseGeminiSseLine(allocator, current_line) catch {
+                        if (!saw_delta) try appendGeminiStreamErrorCandidate(&error_body_buf, allocator, current_line);
                         line_buf.clearRetainingCapacity();
                         continue;
                     };
                     line_buf.clearRetainingCapacity();
                     switch (result) {
                         .delta => |text| {
+                            saw_delta = true;
                             defer allocator.free(text);
                             try accumulated.appendSlice(allocator, text);
                             callback(ctx, root.StreamChunk.textDelta(text));
                         },
                         .done => break,
-                        .skip => {},
+                        .skip => if (!saw_delta) try appendGeminiStreamErrorCandidate(&error_body_buf, allocator, current_line),
                     }
                 } else {
                     try line_buf.append(allocator, byte);
@@ -895,20 +967,25 @@ pub const GeminiProvider = struct {
 
         // Parse trailing line if stream ended without final newline.
         if (line_buf.items.len > 0) {
-            if (extractGeminiUsageFromSseLine(allocator, line_buf.items) catch null) |usage| {
+            const current_line = line_buf.items;
+            if (extractGeminiUsageFromSseLine(allocator, current_line) catch null) |usage| {
                 stream_usage = usage;
             }
-            const trailing = parseGeminiSseLine(allocator, line_buf.items) catch null;
+            const trailing = parseGeminiSseLine(allocator, current_line) catch blk: {
+                if (!saw_delta) try appendGeminiStreamErrorCandidate(&error_body_buf, allocator, current_line);
+                break :blk null;
+            };
             line_buf.clearRetainingCapacity();
             if (trailing) |result| {
                 switch (result) {
                     .delta => |text| {
+                        saw_delta = true;
                         defer allocator.free(text);
                         try accumulated.appendSlice(allocator, text);
                         callback(ctx, root.StreamChunk.textDelta(text));
                     },
                     .done => {},
-                    .skip => {},
+                    .skip => if (!saw_delta) try appendGeminiStreamErrorCandidate(&error_body_buf, allocator, current_line),
                 }
             }
         }
@@ -919,9 +996,32 @@ pub const GeminiProvider = struct {
             if (n == 0) break;
         }
 
+        const stderr_text: ?[]u8 = if (child.stderr) |stderr_file|
+            stderr_file.readToEndAlloc(allocator, 8 * 1024) catch null
+        else
+            null;
+        defer if (stderr_text) |text| allocator.free(text);
+
         const term = child.wait() catch return error.CurlWaitError;
         switch (term) {
-            .Exited => |code| if (code != 0) return error.CurlFailed,
+            .Exited => |code| if (code != 0) {
+                if (error_body_buf.items.len > 0) {
+                    if (classifyGeminiErrorPayload(allocator, error_body_buf.items)) |classified_err| {
+                        logGeminiApiError(allocator, "stream", error_body_buf.items);
+                        return classified_err;
+                    }
+
+                    logGeminiApiError(allocator, "stream", error_body_buf.items);
+                    return error.ApiError;
+                }
+
+                if (stderr_text) |stderr| {
+                    if (std.mem.trim(u8, stderr, " \t\r\n").len > 0) {
+                        logGeminiApiError(allocator, "stream curl", stderr);
+                    }
+                }
+                return error.CurlFailed;
+            },
             else => return error.CurlFailed,
         }
 
@@ -1314,6 +1414,32 @@ test "extractGeminiUsageMetadata derives missing total from prompt and completio
     try std.testing.expectEqual(@as(u32, 7), usage.prompt_tokens);
     try std.testing.expectEqual(@as(u32, 5), usage.completion_tokens);
     try std.testing.expectEqual(@as(u32, 12), usage.total_tokens);
+}
+
+test "classifyGeminiErrorPayload recognizes rate-limited stream body" {
+    const payload =
+        \\data: {"error":{"code":429,"message":"Too many requests"}}
+    ;
+    const classified = classifyGeminiErrorPayload(std.testing.allocator, payload).?;
+    try std.testing.expect(classified == error.RateLimited);
+}
+
+test "classifyGeminiErrorPayload recognizes generic api error body" {
+    const payload =
+        \\{"error":{"message":"Invalid API key sk-secret-token"}}
+    ;
+    const classified = classifyGeminiErrorPayload(std.testing.allocator, payload).?;
+    try std.testing.expect(classified == error.ApiError);
+}
+
+test "appendGeminiStreamErrorCandidate strips data prefix" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try appendGeminiStreamErrorCandidate(&buf, alloc, "data: {\"error\":{\"message\":\"boom\"}}\r");
+    try appendGeminiStreamErrorCandidate(&buf, alloc, ":keepalive");
+    try std.testing.expectEqualStrings("{\"error\":{\"message\":\"boom\"}}", buf.items);
 }
 
 test "parseResponse error response" {
